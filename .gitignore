@@ -1,0 +1,30 @@
+# Dependencies and generated output
+node_modules/
+coverage/
+dist/
+build/
+*.log
+
+# Local HTTPS credentials and environment files
+.certs/
+*.pem
+*.key
+.env
+.env.*
+!.env.example
+
+# Local development notes and editor state
+/notes/
+.agents/
+.codex/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# Browser test artifacts
+/screenshots/
+/test-results/
+/playwright-report/

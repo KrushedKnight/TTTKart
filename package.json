@@ -1,0 +1,40 @@
+{
+  "name": "tttkart",
+  "version": "1.0.0",
+  "description": "Open-source browser kart racer with a phone-as-steering-wheel controller",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node tools/kart-test.mjs && node tools/race-logic-test.mjs",
+    "test:net": "node tools/test-net.mjs",
+    "test:integration": "node tools/integration-test.mjs",
+    "test:pad": "node tools/pad-test.mjs",
+    "sim": "node tools/sim.mjs",
+    "check:track": "node tools/track-check.mjs"
+  },
+  "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/johrmohr/TTTKart.git"
+  },
+  "bugs": {
+    "url": "https://github.com/johrmohr/TTTKart/issues"
+  },
+  "homepage": "https://github.com/johrmohr/TTTKart#readme",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "type": "module",
+  "dependencies": {
+    "express": "^5.3.0",
+    "qrcode": "^1.5.4",
+    "selfsigned": "^5.5.0",
+    "socket.io": "^4.8.4",
+    "three": "^0.186.1"
+  },
+  "devDependencies": {
+    "puppeteer-core": "^25.13.0",
+    "socket.io-client": "^4.8.4"
+  },
+  "private": true
+}

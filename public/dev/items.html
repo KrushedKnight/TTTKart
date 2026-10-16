@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Items Sandbox</title>
+<link rel="icon" href="data:,">
+<style>
+  :root { color-scheme: light; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #9fd3f5; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #hud { position: fixed; left: 10px; top: 8px; color: #fff; font: 600 12px/1.35 ui-monospace, Menlo, monospace;
+         text-shadow: 0 1px 2px #000, 0 0 4px #000; white-space: pre; pointer-events: none; }
+</style>
+<script type="importmap">{"imports":{"three":"/vendor/three/build/three.module.js","three/addons/":"/vendor/three/examples/jsm/"}}</script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"></div>
+<script type="module">
+// RACE LOGIC sandbox: item visuals + CPU item usage on the real world.
+//
+//   /dev/items.html?scene=showcase|boxes|banana|bouncer|rocket|stink|star|zap|race
+//        [&t=2.0]       fast-forward to sim time t and freeze (deterministic screenshots)
+//        [&follow=0]    race scene: chase-camera target kart index
+//        [&quality=low] world quality
+//        [&hud=0]
+// Fixed step: every rendered frame advances 1/60 s in 2 substeps, in the
+// same order as main.js (AI -> items -> karts -> collisions -> race).
+// Debug handle: window.__items { items, race, karts, views, effects, stats() }.
+import * as THREE from 'three';
+import { getTrack } from '../js/track.js';
+import { buildWorld } from '../js/world.js';
+import { Kart, resolveKartCollisions } from '../js/kart.js';
+import { CHARACTERS } from '../js/characters.js';
+import { KartView } from '../js/kartview.js';
+import { Effects } from '../js/effects.js';
+import { ChaseCamera } from '../js/camera.js';
+import { ItemSystem } from '../js/items.js';
+import { AIDriver, createAIDrivers } from '../js/ai.js';
+import { Race } from '../js/race.js';
+import { RACE } from '../js/config.js';
+import { makeRng } from '../js/utils.js';
+
+const Q = new URLSearchParams(location.search);
+const SCENE = Q.get('scene') || 'showcase';
+const num = (k, d) => (Q.has(k) && Q.get(k) !== '' ? Number(Q.get(k)) : d);
+const FRAME_DT = 1 / 60, SUBSTEPS = 2;
+const hud = document.getElementById('hud');
+if (Q.get('hud') === '0') hud.style.display = 'none';
+
+// ------------------------------------------------------------ renderer/world
+const canvas = document.getElementById('c');
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(2, window.devicePixelRatio || 1));
+renderer.setSize(innerWidth, innerHeight, false);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFShadowMap;
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(70, innerWidth / innerHeight, 0.1, 2000);
+const track = getTrack();
+const world = buildWorld(scene, track, { renderer, quality: Q.get('quality') || 'high' });
+const effects = new Effects(scene);
+addEventListener('resize', () => {
+  renderer.setSize(innerWidth, innerHeight, false);
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+});
+
+// ------------------------------------------------------------ karts + systems
+const karts = CHARACTERS.map((c) => new Kart({ id: c.id, character: c, track }));
+karts.forEach((k, i) => k.placeOnGrid(track.gridSlot(i)));
+const views = karts.map((k) => new KartView(k, scene, effects));
+const items = new ItemSystem({ track, karts, scene, effects, rng: makeRng(4) });
+const race = new Race({ track, karts, laps: 3, player: null });
+const chase = new ChaseCamera(camera);
+
+// Place a kart at (s, lateral) facing along the road, moving at `speed`.
+function placeAt(k, s, lat = 0, speed = 0) {
+  track.pointAt(s, lat, k.position);
+  k.yaw = track.frameAt(s).yaw;
+  k.velocity.set(Math.sin(k.yaw) * speed, 0, Math.cos(k.yaw) * speed);
+  k.hint = -1;
+  track.project(k.position, -1, k.proj);
+  k.hint = k.proj.index;
+  k.position.y = k.proj.height;
+}
+// Race distances for karts teleported within lap 1 (keeps places / rocket targets sane).
+function syncDistances() { race.update(1e-4); for (const k of karts) k.distance = track.deltaS(0, k.proj.s); race.update(1e-4); }
+function give(k, item) { k.item = item; k.itemCount = item === 'triple_toot' ? 3 : 1; return items.useItem(k); }
+// Fixed camera from track coordinates: eye at (s, lat, height) looking at (s2, lat2, h2).
+const _eye = new THREE.Vector3(), _at = new THREE.Vector3();
+function camTrack(s, lat, h, s2, lat2, h2) {
+  track.pointAt(s, lat, _eye); _eye.y += h;
+  track.pointAt(s2, lat2, _at); _at.y += h2;
+  camera.position.copy(_eye);
+  camera.lookAt(_at);
+}
+// Camera behind + above an object, looking at it (optionally a point ahead of it).
+function camFollow(obj, yaw, back, up, side = 0, ahead = 4, lookUp = 0.6) {
+  const fx = Math.sin(yaw), fz = Math.cos(yaw);
+  camera.position.set(obj.x - fx * back - fz * side, obj.y + up, obj.z - fz * back + fx * side);
+  camera.lookAt(obj.x + fx * ahead, obj.y + lookUp, obj.z + fz * ahead);
+}
+
+// Start the race immediately (no intro / countdown) so items are live.
+race.skipIntro();
+race.update(RACE.countdownSeconds + 0.01);
+
+// ------------------------------------------------------------ scenes
+// Each scene: setup(), drivers (AI for moving karts), script [{t, fn}], camera(t).
+const ctxNoItems = { karts, items: null, race, player: null };
+const ctxItems = { karts, items, race, player: null };
+let drivers = [];
+let ctx = ctxNoItems;
+let script = [];
+let cameraFn = null;
+let stopAt = num('t', Infinity);
+const at = (t, fn) => script.push({ t, fn, done: false });
+const park = () => karts.forEach((k, i) => placeAt(k, 520 + i * 25, 0, 0));
+const drive = (...ks) => { drivers = ks.map((k) => new AIDriver(k, { track, skill: 0.95, rng: makeRng(k.id.length) })); };
+
+const SCENES = {
+  // the five item boxes of row 0 + a kart smashing one
+  boxes() {
+    park();
+    const k = karts[0];
+    const row = items.boxes.filter((b) => b.row === 0);
+    placeAt(k, row[1].s - 34, row[1].lateral, 22);
+    drivers = [];
+    const keep = () => { k.input.throttle = 1; k.input.steer = 0; };
+    script.push({ t: 0, fn: keep, every: true });
+    cameraFn = () => camTrack(row[2].s - 11, -1.5, 2.2, row[2].s + 2, 0.5, 0.9);
+    if (!Q.has('t')) stopAt = 1.62;
+  },
+  // bananas dropped by a kart, a second kart spinning out on one
+  banana() {
+    park();
+    const [a, b] = karts;
+    placeAt(a, 10, 2, 20); placeAt(b, -30, 2, 25);
+    drive(a);
+    at(0.35, () => give(a, 'banana'));
+    at(0.85, () => give(a, 'banana'));
+    at(1.35, () => give(a, 'banana'));
+    script.push({ t: 0, every: true, fn: () => { b.input.throttle = 1; b.input.steer = 0; } });
+    cameraFn = () => camTrack(14, -6.5, 2.0, 34, 2, 0.2);
+    if (!Q.has('t')) stopAt = 2.2;
+  },
+  // a bouncer fired at the kart ahead (and one bouncing off the wall)
+  bouncer() {
+    park();
+    const [a, b, c] = karts;
+    placeAt(a, 0, -2, 24); placeAt(b, 60, -2, 20); placeAt(c, 4, 4, 24);
+    drive(a, b, c);
+    at(0.3, () => give(a, 'bouncer'));
+    at(0.32, () => { c.yaw += 0.5; give(c, 'bouncer'); c.yaw -= 0.5; });
+    const p = new THREE.Vector3();
+    cameraFn = () => {
+      const ball = items.projectiles.find((x) => x.type === 'bouncer' && x.owner === a);
+      if (ball) p.lerp(ball.position, 0.25); else p.copy(a.position);
+      camFollow(p, track.frameAt(a.proj.s).yaw, 7, 2.6, 2.5, 6, 0.5);
+    };
+    if (!Q.has('t')) stopAt = 0.62;
+  },
+  // a rocket chasing the kart one place ahead: trail + lock-on ring
+  rocket() {
+    park();
+    const [a, b] = karts;
+    placeAt(b, 70, 4, 22); placeAt(a, 12, -5, 22);
+    for (const k of karts.slice(2)) placeAt(k, 600 + karts.indexOf(k) * 20, 0, 0);
+    syncDistances();
+    drive(a, b);
+    at(0.2, () => give(a, 'rocket'));
+    const p = new THREE.Vector3();
+    let yaw = 0;
+    cameraFn = () => {
+      const r = items.projectiles.find((x) => x.type === 'rocket');
+      if (r) { p.copy(r.position); yaw = Math.atan2(r.dir.x, r.dir.z); } else if (!p.lengthSq()) p.copy(a.position);
+      camFollow(p, yaw, 6.5, 1.6, -3.8, 8, 0.2);
+    };
+    if (!Q.has('t')) stopAt = 0.72;
+  },
+  // stink cloud on the road with karts weaving around it
+  stink() {
+    park();
+    const [a, b, c] = karts;
+    placeAt(a, 30, 0, 18); placeAt(b, -10, -3, 24); placeAt(c, -20, 4, 24);
+    drive(a, b, c);
+    ctx = ctxItems;
+    at(0.3, () => give(a, 'stink'));
+    cameraFn = () => camTrack(8, 3.5, 2.6, 30, -0.5, 1.6);
+    if (!Q.has('t')) stopAt = 1.6;
+  },
+  // rainbow star kart (KartView handles the tint + sparkles)
+  star() {
+    park();
+    const [a, b] = karts;
+    placeAt(a, 10, 0, 20); placeAt(b, 26, 3, 18);
+    drive(a, b);
+    at(0.2, () => give(a, 'star'));
+    cameraFn = () => { chase.setTarget(a); chase.update(FRAME_DT); };
+    chase.setTarget(a); chase.snap();
+    if (!Q.has('t')) stopAt = 1.5;
+  },
+  // zap from last place: lightning strikes everyone ahead
+  zap() {
+    park();
+    const ks = karts.slice(0, 5);
+    placeAt(ks[0], 52, -4, 18); placeAt(ks[1], 44, 3, 18); placeAt(ks[2], 37, -1, 18);
+    placeAt(ks[3], 30, 4.5, 18); placeAt(ks[4], 14, 0, 18);
+    syncDistances();
+    drive(...ks);
+    at(0.25, () => give(ks[4], 'zap'));
+    cameraFn = () => camTrack(4, -2, 3.2, 40, 0, 0.8);
+    if (!Q.has('t')) stopAt = 0.33;
+  },
+  // everything at once on the start straight (frozen at t = 0.8 by default)
+  showcase() {
+    park();
+    const ks = karts;
+    placeAt(ks[0], 24.2, -6, 0);      // banana dropper (parked, then moved away)
+    placeAt(ks[5], 43, -3.5, 0);      // stink dropper (parked, then moved away)
+    placeAt(ks[1], 4, -3, 18);        // bouncer shooter
+    placeAt(ks[4], 16, -0.5, 12);     // star kart
+    placeAt(ks[2], 26, 4, 14);        // rocket shooter (targets ks[3], one place ahead)
+    placeAt(ks[3], 70, 6, 14);
+    syncDistances();
+    drive(ks[1], ks[2], ks[3], ks[4]);
+    at(0.02, () => { give(ks[0], 'banana'); placeAt(ks[0], 640, 0); give(ks[5], 'stink'); placeAt(ks[5], 660, 0); });
+    at(0.1, () => give(ks[4], 'star'));
+    at(0.4, () => give(ks[2], 'rocket'));
+    at(0.5, () => give(ks[1], 'bouncer'));
+    cameraFn = () => camTrack(6, 1, 3.4, 42, 0, 0.4);
+    if (!Q.has('t')) stopAt = 0.8;
+  },
+  // full CPU race with items; chase cam on `follow`
+  race() {
+    karts.forEach((k, i) => k.placeOnGrid(track.gridSlot(i)));
+    race.startCountdown();
+    drivers = createAIDrivers(karts, { track, difficulty: Q.get('difficulty') || 'normal', rng: makeRng(num('seed', 1)) });
+    ctx = ctxItems;
+    const target = karts[Math.min(num('follow', 0), karts.length - 1)];
+    chase.setTarget(target); chase.snap();
+    cameraFn = () => chase.update(FRAME_DT);
+  },
+};
+(SCENES[SCENE] || SCENES.showcase)();
+
+// ?cam=near[&what=hazard|projectile|kart][&idx=0][&dist=5][&side=2][&up=1.6]:
+// frame one object from close up (camera behind it along the road + to the side).
+if (Q.get('cam') === 'near') {
+  const what = Q.get('what') || 'hazard', idx = num('idx', 0);
+  const dist = num('dist', 5), side = num('side', 2), up = num('up', 1.6);
+  const tmpProj = {};
+  const pos = new THREE.Vector3();
+  cameraFn = () => {
+    const list = what === 'projectile' ? items.projectiles : what === 'kart' ? karts : items.hazards;
+    const o = list[Math.min(idx, list.length - 1)];
+    if (!o) return;
+    pos.copy(o.position);
+    track.project(pos, -1, tmpProj);
+    const t = tmpProj.tangent, r = tmpProj.right;
+    camera.position.set(pos.x - t.x * dist + r.x * side, pos.y + up, pos.z - t.z * dist + r.z * side);
+    camera.lookAt(pos.x, pos.y + 0.35, pos.z);
+  };
+}
+if (SCENE !== 'race') { for (const k of karts) k.frozen = false; }
+
+// ------------------------------------------------------------ loop
+let simTime = 0, stopped = false;
+const focus = new THREE.Vector3();
+function step() {
+  const h = FRAME_DT / SUBSTEPS;
+  for (let n = 0; n < SUBSTEPS; n++) {
+    for (const d of drivers) d.update(h, ctx);
+    for (const e of script) {
+      if (e.every) { if (simTime >= e.t) e.fn(); }
+      else if (!e.done && simTime >= e.t) { e.done = true; e.fn(); }
+    }
+    items.update(h, race);
+    for (const k of karts) k.update(h);
+    resolveKartCollisions(karts);
+    race.update(h);
+    simTime += h;
+  }
+  for (const v of views) v.update(FRAME_DT, camera);
+  if (cameraFn) cameraFn(simTime);
+  effects.update(FRAME_DT, camera);
+}
+const stats = () => ({
+  t: +simTime.toFixed(3), calls: renderer.info.render.calls, tris: renderer.info.render.triangles,
+  particles: effects.count, hazards: items.hazards.length, projectiles: items.projectiles.map((p) => `${p.type}:${p.mode}`),
+  boxesActive: items.boxes.filter((b) => b.active).length, used: items.used,
+  hits: karts.filter((k) => k.isDisabled()).map((k) => k.id),
+});
+window.__items = { items, race, karts, views, effects, scene, renderer, stats };
+
+let fps = 0, frames = 0, last = performance.now(), hudT = 0;
+function frame() {
+  if (!stopped) {
+    let guard = 0;
+    do {
+      step();
+      if (simTime >= stopAt - 1e-6) { stopped = true; console.log(`[items] stopped at t=${simTime.toFixed(3)}`); break; }
+    } while (isFinite(stopAt) && simTime < stopAt - 0.2 && ++guard < 20);
+  }
+  focus.copy(camera.position).lerp(_at.lengthSq() ? _at : camera.position, 0.5);
+  world.update(stopped ? 0 : FRAME_DT, cameraFn && SCENE === 'race' ? chase.target?.position || focus : focus, camera);
+  renderer.render(scene, camera);
+  frames++;
+  const now = performance.now();
+  if (now - last > 500) { fps = (frames * 1000) / (now - last); frames = 0; last = now; }
+  if ((hudT -= FRAME_DT) <= 0) {
+    hudT = 0.25;
+    const s = stats();
+    hud.textContent = `${SCENE}  t ${s.t}${stopped ? ' (stopped)' : ''}  fps ${fps.toFixed(0)}\n` +
+      `calls ${s.calls}  tris ${s.tris}  particles ${s.particles}\n` +
+      `boxes ${s.boxesActive}/${items.boxes.length}  hazards ${s.hazards}  projectiles ${s.projectiles.join(' ') || '-'}\n` +
+      `race ${race.state} ${race.time.toFixed(1)}s  leader ${race.standings[0].id}  disabled ${s.hits.join(',') || '-'}`;
+  }
+  requestAnimationFrame(frame);
+}
+frame();
+setTimeout(() => console.log('[items] stats', JSON.stringify(stats())), 1500);
+</script>
+</body>
+</html>

@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#090b17">
+  <meta name="format-detection" content="telephone=no">
+  <title>KRISHIV KART · Wheel</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Ccircle cx='32' cy='32' r='26' fill='none' stroke='%23ffd23f' stroke-width='9'/%3E%3Ccircle cx='32' cy='32' r='8' fill='%23ff4fa3'/%3E%3Cpath d='M8 32h16M40 32h16M32 40v16' stroke='%23ffd23f' stroke-width='7'/%3E%3C/svg%3E">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Lilita+One&family=Nunito:wght@700;800;900&display=swap">
+  <link rel="stylesheet" href="/css/pad.css">
+  <script src="/socket.io/socket.io.js"></script>
+  <script type="module" src="/js/pad.js"></script>
+</head>
+<body>
+<div id="stage" class="stage" data-screen="boot" data-steer="none">
+  <div class="bg-speed" aria-hidden="true"></div>
+
+  <!-- ============================================================ top bar -->
+  <header id="topbar" class="topbar">
+    <div class="tb-side tb-left">
+      <button id="btn-pause" class="tb-btn round" aria-label="Pause">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="5" width="4.2" height="14" rx="1.6"/><rect x="13.8" y="5" width="4.2" height="14" rx="1.6"/></svg>
+      </button>
+      <div class="chip" id="chip-conn" title="Connection">
+        <span class="dot" id="conn-dot"></span>
+        <span class="chip-room" id="room-label">----</span>
+        <span class="chip-ping" id="ping-label"></span>
+      </div>
+    </div>
+    <div class="tb-center">
+      <div class="race-readout" id="race-readout">
+        <div class="place" id="place"><span id="place-num">–</span><span class="place-suf" id="place-suf"></span><span class="place-of" id="place-of"></span></div>
+        <div class="lap">LAP <b id="lap-num">1</b><span class="lap-of">/<span id="lap-total">3</span></span></div>
+      </div>
+      <div class="tb-title" id="tb-title">KRISHIV <span>KART</span></div>
+    </div>
+    <div class="tb-side tb-right">
+      <button id="btn-center" class="tb-btn pill" aria-label="Center steering">
+        <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round"><circle cx="12" cy="12" r="6.5"/><path d="M12 1.8v4.4M12 17.8v4.4M1.8 12h4.4M17.8 12h4.4"/></svg>
+        <span>CENTER</span>
+      </button>
+      <button id="btn-settings" class="tb-btn round" aria-label="Settings">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><g><rect x="10.3" y="1.6" width="3.4" height="5" rx="1.1"/><rect x="10.3" y="1.6" width="3.4" height="5" rx="1.1" transform="rotate(45 12 12)"/><rect x="10.3" y="1.6" width="3.4" height="5" rx="1.1" transform="rotate(90 12 12)"/><rect x="10.3" y="1.6" width="3.4" height="5" rx="1.1" transform="rotate(135 12 12)"/><rect x="10.3" y="1.6" width="3.4" height="5" rx="1.1" transform="rotate(180 12 12)"/><rect x="10.3" y="1.6" width="3.4" height="5" rx="1.1" transform="rotate(225 12 12)"/><rect x="10.3" y="1.6" width="3.4" height="5" rx="1.1" transform="rotate(270 12 12)"/><rect x="10.3" y="1.6" width="3.4" height="5" rx="1.1" transform="rotate(315 12 12)"/><circle cx="12" cy="12" r="6.6"/></g><circle cx="12" cy="12" r="2.7" class="gear-hole"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <main class="screens">
+    <!-- ============================================================ insecure context -->
+    <section id="scr-insecure" class="screen info">
+      <div class="card info-card">
+        <div class="info-icon">🔒</div>
+        <h2>Secure page needed</h2>
+        <p>Phones only share their tilt sensors with <b>https://</b> pages. Open the secure address and accept the certificate warning to steer by tilting.</p>
+        <div class="info-actions">
+          <a id="insecure-link" class="mbtn green" href="#">OPEN SECURE PAGE</a>
+          <button id="btn-insecure-touch" class="mbtn ghost">Use touch steering</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================ room code entry -->
+    <section id="scr-code" class="screen code">
+      <div class="code-left">
+        <div class="logo small">KRISHIV <span>KART</span></div>
+        <h2>ENTER ROOM CODE</h2>
+        <p class="muted">It's under the QR code on the big screen.</p>
+        <div class="code-slots" id="code-slots"><span></span><span></span><span></span><span></span></div>
+        <p class="code-error" id="code-error" role="alert"></p>
+        <button id="btn-code-join" class="mbtn green">JOIN</button>
+      </div>
+      <div class="keypad" id="keypad" aria-label="Letter keypad"></div>
+    </section>
+
+    <!-- ============================================================ tap-to-start gate -->
+    <section id="scr-gate" class="screen gate">
+      <div class="gate-left">
+        <div class="logo">KRISHIV<br><span>KART</span></div>
+        <div class="gate-help">
+          <div class="phone-demo" aria-hidden="true"><div class="phone-demo-body"><i></i><i></i></div></div>
+          <p>Hold your phone sideways like a steering wheel.<br><b>Tilt to steer</b> — thumbs on the buttons.</p>
+        </div>
+        <p class="gate-perm" id="gate-perm">When asked, allow <b>Motion &amp; Orientation</b> access.</p>
+      </div>
+      <div class="gate-right">
+        <button id="btn-gate" class="gate-btn">
+          <svg viewBox="-100 -100 200 200" aria-hidden="true"><circle r="70" fill="none" stroke="currentColor" stroke-width="18"/><circle r="18" fill="currentColor"/><path d="M-70 0H-18M18 0H70M0 18V70" stroke="currentColor" stroke-width="16" stroke-linecap="round"/></svg>
+          <span>TAP TO<br>START</span>
+        </button>
+        <div class="status-line" id="gate-status"><span class="dot"></span><span id="gate-status-text">Connecting…</span></div>
+      </div>
+    </section>
+
+    <!-- ============================================================ connecting / waiting -->
+    <section id="scr-connecting" class="screen center-msg">
+      <div class="spinner" aria-hidden="true"></div>
+      <h2 id="connecting-title">Connecting…</h2>
+      <p class="muted" id="connecting-sub">Joining the game</p>
+    </section>
+
+    <!-- ============================================================ title -->
+    <section id="scr-title" class="screen title">
+      <div class="title-left">
+        <div class="logo big">KRISHIV<br><span>KART</span></div>
+        <div class="tagline">Your phone is the steering wheel</div>
+      </div>
+      <div class="title-right">
+        <button id="btn-start" class="mbtn green huge" data-menu="start">START</button>
+        <p class="muted small-tip">Tap <b>CENTER</b> any time to re-center your wheel.</p>
+      </div>
+    </section>
+
+    <!-- ============================================================ character select -->
+    <section id="scr-select" class="screen select">
+      <div class="sel-main">
+        <h2 class="screen-title">CHOOSE YOUR RACER</h2>
+        <div class="char-grid scroll" id="char-grid"></div>
+      </div>
+      <div class="sel-side">
+        <div class="seg" id="diff-seg" role="radiogroup" aria-label="Difficulty"></div>
+        <button id="btn-go" class="mbtn green huge" data-menu="go">RACE!</button>
+        <button id="btn-customize" class="mbtn purple slim">
+          <svg class="mbtn-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 5.5l4 4M4 20l1-5L15.5 4.5a2.1 2.1 0 0 1 3 0l1 1a2.1 2.1 0 0 1 0 3L9 19z"/></svg>
+          <span>CUSTOMIZE</span>
+        </button>
+      </div>
+    </section>
+
+    <!-- ============================================================ garage (racer customization, SPEC §13.8) -->
+    <section id="scr-garage" class="screen garage">
+      <div class="gar-main">
+        <div class="gar-head">
+          <button id="gar-name" class="gar-name" aria-label="Edit your racer's name">
+            <span class="gn-label">NAME</span>
+            <span class="gn-text" id="gar-name-text"></span>
+            <svg class="gn-pen" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 5.5l4 4M4 20l1-5L15.5 4.5a2.1 2.1 0 0 1 3 0l1 1a2.1 2.1 0 0 1 0 3L9 19z"/></svg>
+          </button>
+          <div class="seg gar-tabs" id="gar-tabs" role="tablist" aria-label="Customize"></div>
+        </div>
+        <div class="gar-fields scroll" id="gar-fields"></div>
+      </div>
+      <div class="gar-side">
+        <div class="gar-stats" id="gar-stats" aria-label="Racer stats"></div>
+        <div class="gar-btns">
+          <button class="mbtn purple" id="gar-random" data-menu="randomize"><span class="dice" aria-hidden="true">🎲</span>RANDOM</button>
+          <button class="mbtn ghost" id="gar-reset" data-menu="reset">RESET</button>
+          <button class="mbtn blue" id="gar-done" data-menu="done">DONE</button>
+          <button class="mbtn green" id="gar-go" data-menu="go">RACE!</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ============================================================ race controls -->
+    <section id="scr-race" class="screen race">
+      <div class="col col-left">
+        <button class="pbtn btn-item" id="btn-item" aria-label="Use item">
+          <span class="item-slot"><span class="item-icon" id="item-icon"></span><span class="item-count" id="item-count"></span></span>
+          <span class="pbtn-label">ITEM</span>
+        </button>
+        <button class="pbtn btn-drift" id="btn-drift" aria-label="Drift (hold)">
+          <svg class="pbtn-icon" viewBox="0 0 48 32" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round"><path d="M6 26C16 26 20 20 24 13S34 5 42 5"/><path d="M35 3l7 2-3 7"/><path d="M8 13l3 1M13 6l2 3M4 20l3-1" stroke-width="3.2"/></svg>
+          <span class="pbtn-label">DRIFT</span>
+        </button>
+      </div>
+
+      <div class="col col-center">
+        <div class="wheel-wrap" id="wheel-wrap">
+          <svg id="wheel" class="wheel" viewBox="-100 -100 200 200" aria-hidden="true">
+            <defs>
+              <linearGradient id="wg-rim" x1="0" y1="-1" x2="0" y2="1" gradientUnits="objectBoundingBox">
+                <stop offset="0" stop-color="#5b6399"/><stop offset="0.55" stop-color="#2a2f57"/><stop offset="1" stop-color="#171a36"/>
+              </linearGradient>
+              <radialGradient id="wg-hub" cx="0.4" cy="0.35" r="0.75">
+                <stop offset="0" stop-color="#fff3a6"/><stop offset="0.45" stop-color="#ffd23f"/><stop offset="1" stop-color="#ff8a1f"/>
+              </radialGradient>
+              <linearGradient id="wg-spoke" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0" stop-color="#454c80"/><stop offset="1" stop-color="#22264a"/>
+              </linearGradient>
+            </defs>
+            <circle r="84" fill="none" stroke="#0d0f22" stroke-width="26"/>
+            <circle r="84" fill="none" stroke="url(#wg-rim)" stroke-width="20"/>
+            <path d="M-84 -26A88 88 0 0 1 -84 26" fill="none" stroke="#ff4fa3" stroke-width="22" stroke-linecap="round" transform="rotate(0)"/>
+            <path d="M84 -26A88 88 0 0 0 84 26" fill="none" stroke="#ff4fa3" stroke-width="22" stroke-linecap="round"/>
+            <circle r="92" fill="none" stroke="rgba(255,255,255,0.10)" stroke-width="2"/>
+            <circle r="75" fill="none" stroke="rgba(0,0,0,0.35)" stroke-width="2"/>
+            <path d="M-76 -4H-28V8H-76Z" fill="url(#wg-spoke)" stroke="#0d0f22" stroke-width="3" stroke-linejoin="round"/>
+            <path d="M76 -4H28V8H76Z" fill="url(#wg-spoke)" stroke="#0d0f22" stroke-width="3" stroke-linejoin="round"/>
+            <path d="M-9 28H9L12 76H-12Z" fill="url(#wg-spoke)" stroke="#0d0f22" stroke-width="3" stroke-linejoin="round"/>
+            <circle r="33" fill="#0d0f22"/>
+            <circle r="29" fill="url(#wg-hub)"/>
+            <ellipse cx="-8" cy="-12" rx="14" ry="7" fill="rgba(255,255,255,0.45)"/>
+            <text y="9" text-anchor="middle" class="wheel-logo">KK</text>
+            <rect x="-7" y="-101" width="14" height="22" rx="4" fill="#ffd23f" stroke="#0d0f22" stroke-width="3"/>
+          </svg>
+          <div class="countdown" id="countdown" aria-live="polite"></div>
+          <div class="finish-banner" id="finish-banner"></div>
+        </div>
+        <div class="tilt-meter" id="tilt-meter" aria-hidden="true">
+          <div class="tm-dead"></div>
+          <div class="tm-fill tm-left" id="tm-left"></div>
+          <div class="tm-fill tm-right" id="tm-right"></div>
+          <div class="tm-mid"></div>
+        </div>
+        <div class="touch-steer" id="touch-steer">
+          <div class="ts-track" id="ts-track"><div class="ts-arrows"><span>‹‹</span><span>››</span></div><div class="ts-knob" id="ts-knob"></div></div>
+        </div>
+        <div class="steer-mode" id="steer-mode">TILT TO STEER</div>
+      </div>
+
+      <div class="col col-right">
+        <button class="pbtn btn-gas" id="btn-gas" aria-label="Gas (hold)">
+          <svg class="pbtn-icon" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12.5l7-7 7 7"/><path d="M5 19.5l7-7 7 7" opacity="0.55"/></svg>
+          <span class="pbtn-label">GAS</span>
+          <span class="auto-badge">AUTO</span>
+        </button>
+        <button class="pbtn btn-brake" id="btn-brake" aria-label="Brake / reverse (hold)">
+          <span class="pbtn-label">BRAKE</span>
+        </button>
+      </div>
+    </section>
+
+    <!-- ============================================================ paused -->
+    <section id="scr-paused" class="screen paused">
+      <h2 class="big-title">PAUSED</h2>
+      <div class="btn-row">
+        <button class="mbtn green" data-menu="resume">RESUME</button>
+        <button class="mbtn orange" data-menu="restart">RESTART</button>
+        <button class="mbtn red" data-menu="quit">QUIT</button>
+      </div>
+    </section>
+
+    <!-- ============================================================ results -->
+    <section id="scr-results" class="screen results">
+      <div class="res-main">
+        <h2 class="screen-title" id="res-title">RESULTS</h2>
+        <ol class="standings scroll" id="standings"></ol>
+      </div>
+      <div class="res-side">
+        <button class="mbtn green" data-menu="again">RACE AGAIN</button>
+        <button class="mbtn blue" data-menu="menu">CHANGE<br>CHARACTER</button>
+      </div>
+    </section>
+
+    <!-- ============================================================ loading -->
+    <section id="scr-loading" class="screen center-msg">
+      <div class="spinner" aria-hidden="true"></div>
+      <h2>LOADING RACE…</h2>
+      <p class="muted">Hold your phone like a wheel — it re-centers at the countdown.</p>
+    </section>
+  </main>
+
+  <!-- ============================================================ overlays -->
+  <div id="ov-waiting" class="overlay">
+    <div class="card">
+      <div class="spinner" aria-hidden="true"></div>
+      <h2>Waiting for the game…</h2>
+      <p class="muted">The desktop disconnected. Keep this page open — it reconnects automatically.</p>
+    </div>
+  </div>
+
+  <div id="ov-kicked" class="overlay">
+    <div class="card">
+      <div class="info-icon">📱</div>
+      <h2>Another controller took over</h2>
+      <p class="muted">Only one phone can drive at a time.</p>
+      <button id="btn-reclaim" class="mbtn green">TAKE BACK CONTROL</button>
+    </div>
+  </div>
+
+  <div id="banner-offline" class="banner-offline"><span class="mini-spinner"></span> <span id="offline-text">Reconnecting…</span><button id="btn-reload" class="banner-btn">RELOAD</button></div>
+
+  <!-- ============================================================ settings sheet -->
+  <div id="sheet" class="sheet" aria-hidden="true">
+    <div class="sheet-backdrop" id="sheet-backdrop"></div>
+    <div class="sheet-panel" role="dialog" aria-label="Settings">
+      <header class="sheet-head">
+        <h3>SETTINGS</h3>
+        <button id="btn-sheet-close" class="tb-btn round" aria-label="Close settings">
+          <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><path d="M6 6l12 12M18 6L6 18"/></svg>
+        </button>
+      </header>
+      <div class="sheet-body scroll" id="sheet-body">
+        <div class="set-row set-col">
+          <div class="set-label">Steering sensitivity <span class="set-val" id="sens-val">full lock at 32°</span></div>
+          <div class="slider-row"><span class="muted">calm</span><div class="slider" id="sens" role="slider" tabindex="0" aria-label="Steering sensitivity" aria-valuemin="18" aria-valuemax="50"><div class="slider-thumb"></div></div><span class="muted">twitchy</span></div>
+        </div>
+        <div class="set-row">
+          <div class="set-label">Steering input</div>
+          <div class="seg small" id="mode-seg">
+            <button data-mode="tilt">TILT</button><button data-mode="touch">TOUCH</button>
+          </div>
+        </div>
+        <div class="set-note" id="tilt-note" hidden>
+          <p><b>Tilt steering is blocked</b> because motion access was denied. iPhone remembers that until Safari restarts: close Safari completely (swipe it away in the app switcher) — or remove this address in <b>Settings › Safari › Advanced › Website Data</b> — then reload this page and tap <b>Allow</b>.</p>
+          <button id="btn-enable-tilt" class="mbtn green slim">TRY TILT AGAIN</button>
+        </div>
+        <label class="set-row">
+          <span class="set-label">Auto-gas <span class="set-sub">accelerate unless braking</span></span>
+          <input type="checkbox" class="switch" id="set-autogas">
+        </label>
+        <label class="set-row">
+          <span class="set-label">Invert steering</span>
+          <input type="checkbox" class="switch" id="set-invert">
+        </label>
+        <label class="set-row">
+          <span class="set-label">Vibration</span>
+          <input type="checkbox" class="switch" id="set-haptics">
+        </label>
+        <button id="btn-sheet-center" class="mbtn blue slim">CENTER STEERING NOW</button>
+        <div class="dbg" id="dbg"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast" role="status"></div>
+  <div id="flash" class="flash" aria-hidden="true"></div>
+</div>
+
+<!-- Outside the (possibly rotated) stage: reads upright while the phone is held upright. -->
+<div id="hint-rotate" class="hint-rotate" role="status"><span class="hint-rotate-icon" aria-hidden="true">📱</span> Turn your phone sideways to drive</div>
+
+<!-- Racer-name editor. Deliberately OUTSIDE #stage: iOS cannot type into a
+     text field inside a CSS-rotated container, and the phone keyboard follows
+     the page's natural orientation anyway. pad.js pins it to the top of the
+     visual viewport, so the keyboard never covers the field. -->
+<div id="name-editor" class="name-editor" aria-hidden="true">
+  <form class="ne-bar" id="ne-form" autocomplete="off" novalidate>
+    <label class="ne-label" for="name-input">YOUR RACER'S NAME</label>
+    <div class="ne-row">
+      <div class="ne-field">
+        <input id="name-input" class="ne-input" type="text" maxlength="12" enterkeyhint="done" inputmode="text"
+               autocomplete="off" autocorrect="off" autocapitalize="words" spellcheck="false" placeholder="Type a name">
+        <button type="button" class="ne-clear" id="ne-clear" aria-label="Clear the name">
+          <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><path d="M7 7l10 10M17 7L7 17"/></svg>
+        </button>
+      </div>
+      <button type="submit" class="ne-done" id="ne-done">DONE</button>
+    </div>
+    <div class="ne-meta"><span id="ne-count">0/12</span><span>Shown on the big screen</span></div>
+  </form>
+  <div class="ne-backdrop" id="ne-backdrop"></div>
+</div>
+</body>
+</html>

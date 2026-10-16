@@ -1,0 +1,734 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<link rel="icon" href="data:,">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KRISHIV KART — HUD sandbox</title>
+<script type="importmap">{"imports":{"three":"/vendor/three/build/three.module.js","three/addons/":"/vendor/three/examples/jsm/"}}</script>
+<link rel="stylesheet" href="../css/game.css">
+<style>
+  /* dev controls (hidden with ?clean for screenshots) */
+  #devbar {
+    position: fixed; left: 50%; bottom: 6px; transform: translateX(-50%); z-index: 100;
+    display: flex; flex-wrap: wrap; gap: 4px; justify-content: center; align-items: center;
+    max-width: min(760px, 94vw); padding: 6px 8px; border-radius: 10px;
+    background: rgba(10, 8, 24, 0.8); color: #ddd; pointer-events: auto;
+    font: 12px/1.2 system-ui, -apple-system, sans-serif; user-select: none; -webkit-user-select: none;
+    opacity: 0.35; transition: opacity 0.2s;
+  }
+  #devbar:hover { opacity: 1; }
+  #devbar button { font: inherit; padding: 3px 7px; border-radius: 6px; border: 1px solid #4a4380; background: #2c2750; color: #fff; cursor: pointer; }
+  #devbar button:hover { background: #3c3470; }
+  #devbar button.on { background: #5a3cc8; }
+  #devbar input[type=range] { width: 220px; }
+  #devbar .t { font-variant-numeric: tabular-nums; min-width: 46px; text-align: right; }
+  body.clean #devbar { display: none; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="hud"></div>
+<div id="devbar"></div>
+<script type="module">
+// HUD sandbox: a scripted, deterministic mock race drives the real HUD.
+//
+//   hud.html                      autoplay the demo (loops)
+//   ?t=19.6&freeze=1              jump to a moment and freeze every animation
+//   ?clean=1                      hide the dev bar (screenshots)
+//   ?bg=paint|world|white|dark    background: painted scene (default), the real
+//                                 3D track (world.js + kart models), or flat
+//                                 white / dark for contrast stress tests
+//   ?char=mochi                   player character
+// Automation: window.hudTest.seek(t, { freeze: true }) replays the timeline in
+// 1/60 s steps (exactly like a 60 fps game) and fast-forwards every Web
+// Animation / CSS transition to its virtual age, so screenshots are exact.
+// window.hudTest.runChecks() runs the automated HUD assertions (see bottom).
+import * as THREE from 'three';
+import { HUD } from '../js/hud.js';
+import { getTrack } from '../js/track.js';
+import { AudioEngine } from '../js/audio.js';
+import { bus } from '../js/bus.js';
+import { RACE, ITEM, ITEM_INFO, ITEM_IDS, DRIFT, BOOST, STAR } from '../js/config.js';
+import { clamp, damp, lerp, smoothstep, makeRng, TAU } from '../js/utils.js';
+
+const params = new URLSearchParams(location.search);
+if (params.has('clean')) document.body.classList.add('clean');
+const track = getTrack();
+
+// ------------------------------------------------------------------ characters
+const FALLBACK_CHARS = [
+  ['blaze', '#ff7a1f'], ['bolt', '#2f6bff'], ['pip', '#e8344e'], ['duke', '#ffc21f'],
+  ['nova', '#8b5cff'], ['gus', '#35c64a'], ['mochi', '#ff7fc0'], ['ziggy', '#15c9b0'],
+].map(([id, cssColor]) => ({ id, name: id, cssColor, ratings: { speed: 3, accel: 3, handling: 3, weight: 3 } }));
+let charsMod = null;
+try { charsMod = await import('../js/characters.js'); } catch (err) {
+  console.warn('[hud sandbox] characters.js unavailable, using fallback colors:', err.message);
+}
+const CHARS = (charsMod && charsMod.CHARACTERS) || FALLBACK_CHARS;
+
+function makeKart(character, slot, isPlayer) {
+  const stats = charsMod ? charsMod.statsFromRatings(character.ratings) : { topSpeed: 29 };
+  const grid = track.gridSlot(slot);
+  return {
+    id: character.id, character, isPlayer, slot, stats,
+    gridD: track.deltaS(0, grid.s), gridLat: grid.lateral, latOff: Math.sin(slot * 2.3) * 2.6,
+    position: new THREE.Vector3(), yaw: 0, frame: {},
+    speed: 0, distance: 0, lap: 1, place: 0, finished: false, finishTime: null, lapTimes: [], wrongWay: false,
+    boostTimer: 0, starTimer: 0,
+    drift: { active: false, dir: 0, charge: 0, tier: 0, hopping: false },
+    item: null, itemCount: 0, rolling: false, rollTimer: 0, rollItem: null,
+  };
+}
+const pIdx = Math.max(0, CHARS.findIndex((c) => c.id === (params.get('char') || 'blaze')));
+const cpus = CHARS.filter((_, i) => i !== pIdx).map((c, k) => makeKart(c, k, false));
+const player = makeKart(CHARS[pIdx], RACE.playerGridSlot, true);
+const karts = [...cpus, player];
+const race = { state: 'countdown', time: 0, countdown: RACE.countdownSeconds, laps: RACE.laps };
+
+// ------------------------------------------------------------------ HUD + audio
+const audio = new AudioEngine();
+const hud = new HUD(document.getElementById('hud'), { audio });
+hud.setTrack(track);
+hud.show();
+let soundOn = false;
+const sfx = (name, o) => { if (soundOn && !seeking) audio.play(name, o); };
+
+// ------------------------------------------------------------------ the script
+const GO = RACE.countdownSeconds;          // virtual time of "GO!"
+const TL = {
+  phone: 0.8,
+  roll1: 5.0,                              // item box → 2 s roulette → triple toot
+  toot1: 8.6, toot2: 10.0, toot3: 11.4,
+  drift0: 12.4, drift1: 16.3,              // drift long enough for an ULTRA (tier 3) charge
+  wrong0: 18.2, wrongOn: 19.0, wrong1: 21.0,
+  lap2: 23.4,
+  roll2: 24.6, rocket: 28.0,
+  phoneLost: 25.6, phoneBack: 27.4,        // the phone drops out and reconnects
+  lap3: 29.4,                              // FINAL LAP
+  roll3: 31.0, star: 33.4,
+  finish: 37.0,
+  end: 43.0,
+};
+// Target place for the player over time; actual places come from distances.
+const PLACE_PLAN = [[0, 8], [3.6, 7], [4.6, 6], [6.0, 5], [8.8, 4], [10.2, 3], [11.6, 2],
+  [21.0, 6], [24.0, 4], [26.0, 3], [28.4, 2], [30.6, 1]];
+const MOMENTS = {
+  'count 3': 0.42, 'count 1': 2.45, 'GO!': 3.3, racing: 4.4, roulette: 6.15, 'item pop': 7.12,
+  'toot ×2': 8.95, 'drift T1': 13.9, 'drift T3': 16.15, 'wrong way': 19.7, 'lap 2': 23.75, 'phone lost': 26.1,
+  'final lap': 29.9, star: 34.2, finish: 37.7, 'finish +2s': 39.5,
+};
+
+const S = {};                              // sim state (reset by resetSim)
+function resetSim() {
+  Object.assign(S, { vt: 0, ev: 0, baseD: 0, baseV: 0, phone: false, wrongWay: false, yawOff: 0, lat: player.gridLat });
+  Object.assign(race, { state: 'countdown', time: 0, countdown: RACE.countdownSeconds });
+  for (const k of karts) {
+    Object.assign(k, { speed: 0, distance: k.gridD, lap: 1, place: 0, finished: false, finishTime: null, wrongWay: false,
+      boostTimer: 0, starTimer: 0, item: null, itemCount: 0, rolling: false, rollTimer: 0, rollItem: null });
+    k.lapTimes = [];
+    Object.assign(k.drift, { active: false, dir: 0, charge: 0, tier: 0 });
+  }
+  placeKarts();
+}
+
+function startRoll(id) {
+  if (player.item || player.rolling) return;
+  sfx('itemBox');
+  player.rolling = true; player.rollTimer = ITEM.rouletteSeconds; player.rollItem = id;
+}
+function useItem() {
+  const id = player.item;
+  if (!id) return;
+  if (id === 'toot' || id === 'triple_toot') { player.boostTimer = Math.max(player.boostTimer, BOOST.tootDuration); sfx('toot'); }
+  else if (id === 'star') { player.starTimer = STAR.duration; sfx('star'); }
+  else sfx(id === 'rocket' ? 'rocket' : 'throw');
+  player.itemCount--;
+  if (player.itemCount <= 0) { player.item = null; player.itemCount = 0; }
+}
+function completeLap() {
+  const done = player.lapTimes.reduce((a, b) => a + b, 0);
+  player.lapTimes.push(race.time - done);
+  player.lap++;
+  if (player.lap === race.laps) {
+    hud.flash('FINAL LAP!', { color: '#ff4f5e', duration: 2.2 });
+    sfx('finalLap');
+    if (soundOn) audio.setMusicIntensity(1);
+  } else {
+    hud.flash(`LAP ${player.lap}`, { color: '#38c8ff', size: 'medium' });
+    sfx('lap');
+  }
+}
+
+const EVENTS = [
+  [0, () => { race.state = 'countdown'; hud.countdown(3); sfx('countdown'); }],
+  [1, () => { hud.countdown(2); sfx('countdown'); }],
+  [2, () => { hud.countdown(1); sfx('countdown'); }],
+  [GO, () => { race.state = 'racing'; hud.countdown(0); sfx('go'); if (soundOn && !seeking) audio.startMusic('race'); }],
+  [TL.phone, () => { S.phone = true; sfx('join'); }],
+  [TL.roll1, () => startRoll('triple_toot')],
+  [TL.toot1, useItem], [TL.toot2, useItem], [TL.toot3, useItem],
+  [TL.drift0, () => { Object.assign(player.drift, { active: true, dir: 1, charge: 0, tier: 0 }); sfx('hop'); }],
+  [TL.drift1, () => {
+    const tier = player.drift.tier;
+    player.drift.active = false;
+    if (tier > 0) { player.boostTimer = Math.max(player.boostTimer, DRIFT.boostDurations[tier]); sfx('boost'); }
+  }],
+  [TL.wrong0, () => { S.wrongWay = true; }],
+  [TL.wrongOn, () => { player.wrongWay = true; hud.setWrongWay(true); }],
+  [TL.wrong1, () => { S.wrongWay = false; player.wrongWay = false; hud.setWrongWay(false); }],
+  [TL.lap2, completeLap],
+  [TL.roll2, () => startRoll('rocket')], [TL.rocket, useItem],
+  [TL.phoneLost, () => { S.phone = false; sfx('leave'); }],
+  [TL.phoneBack, () => { S.phone = true; sfx('join'); }],
+  [TL.lap3, completeLap],
+  [TL.roll3, () => startRoll('star')], [TL.star, useItem],
+  [TL.finish, () => {
+    player.finished = true; player.finishTime = race.time;
+    hud.showFinish(player.place);
+    if (soundOn && !seeking) audio.playJingle(player.place <= 3 ? 'finish' : 'lose');
+  }],
+].sort((a, b) => a[0] - b[0]);
+
+function planPlace(t) {
+  let p = 8;
+  for (const [at, place] of PLACE_PLAN) if (t >= at) p = place;
+  return p;
+}
+
+const sortedD = new Float64Array(7);
+function placeKarts() {
+  const racing = race.state !== 'countdown';
+  const intoRace = smoothstep(race.time / 4);
+  for (const k of karts) {
+    const s = track.wrapS(k.distance);
+    const f = track.frameAt(s, k.frame);
+    const racingLat = clamp(f.racingLine + (k.isPlayer ? 0 : k.latOff), -f.halfWidth + 1.4, f.halfWidth - 1.4);
+    const lat = k.isPlayer ? lerp(k.gridLat, racingLat, intoRace) : lerp(k.gridLat, racingLat, racing ? intoRace : 0);
+    track.pointAt(s, lat, k.position);
+    k.yaw = f.yaw + (k.isPlayer ? S.yawOff : 0);
+  }
+  // places by distance (finished player keeps its finishing place)
+  const order = karts.slice().sort((a, b) => b.distance - a.distance);
+  order.forEach((k, i) => { if (!(k.isPlayer && k.finished)) k.place = i + 1; });
+}
+
+// Advance the mock race by dt seconds of virtual time.
+function advance(dt) {
+  S.vt += dt;
+  if (race.state === 'racing') race.time = S.vt - GO;
+  while (S.ev < EVENTS.length && EVENTS[S.ev][0] <= S.vt + 1e-9) { EVENTS[S.ev][1](); S.ev++; }
+  const racing = race.state === 'racing';
+  race.countdown = Math.max(0, GO - S.vt);
+  if (racing) race.time = S.vt - GO;
+
+  // field: a moving baseline the CPUs string out behind
+  if (racing) { S.baseV = damp(S.baseV, 28.5, 0.8, dt); S.baseD += S.baseV * dt; }
+  const spread = racing ? Math.min(7, 0.3 * race.time) : 0;
+  cpus.forEach((k, i) => {
+    k.distance = k.gridD + S.baseD - k.slot * spread + (racing ? 1.2 * Math.sin(S.vt * 0.7 + i * 1.9) * Math.min(1, race.time) : 0);
+    k.speed = S.baseV;
+  });
+
+  // player timers
+  if (player.boostTimer > 0) player.boostTimer = Math.max(0, player.boostTimer - dt);
+  if (player.starTimer > 0) player.starTimer = Math.max(0, player.starTimer - dt);
+  if (player.rolling) {
+    player.rollTimer -= dt;
+    if (player.rollTimer <= 0) {
+      player.rolling = false; player.rollTimer = 0;
+      player.item = player.rollItem; player.itemCount = ITEM_INFO[player.item].uses; player.rollItem = null;
+      sfx('itemGet');
+    }
+  }
+  const d = player.drift;
+  if (d.active) {
+    d.charge += dt * 1.15;
+    let tier = 0;
+    while (tier < 3 && d.charge >= DRIFT.tierTimes[tier]) tier++;
+    if (tier > d.tier) { d.tier = tier; sfx(`drift${tier}`); }
+  }
+
+  // player progress: glide toward the planned place (or drive backwards)
+  if (racing) {
+    for (let i = 0; i < 7; i++) sortedD[i] = cpus[i].distance;
+    sortedD.sort().reverse();
+    const p = planPlace(S.vt);
+    const target = p <= 1 ? sortedD[0] + 7 : p >= 8 ? sortedD[6] - 5 : (sortedD[p - 2] + sortedD[p - 1]) / 2;
+    const fast = player.boostTimer > 0 || player.starTimer > 0 || player.finished;
+    const rel = S.wrongWay ? -(S.baseV + 7) : clamp((target - player.distance) * 1.5, -9, fast ? 20 : 12);
+    player.distance += (S.baseV + rel) * dt;
+  }
+  S.yawOff = damp(S.yawOff, S.wrongWay ? Math.PI : 0, 3.2, dt);
+  const boosting = player.boostTimer > 0, star = player.starTimer > 0;
+  const vTarget = race.state === 'countdown' ? 0 : S.wrongWay ? 8.5
+    : player.finished ? 21 : 28 + (boosting ? 9 : 0) + (star ? 4 : 0) - (d.active ? 2.5 : 0);
+  player.speed = damp(player.speed, vTarget, vTarget > player.speed ? 2.0 : 3.2, dt);
+  placeKarts();
+}
+
+const hudCtx = () => ({ player, race, karts, items: null, phoneConnected: S.phone });
+
+// ------------------------------------------------------------------ seeking
+let seeking = false;
+const animLog = [];
+const origAnimate = Element.prototype.animate;
+Element.prototype.animate = function (...args) {
+  const a = origAnimate.apply(this, args);
+  if (seeking) animLog.push({ anim: a, vt: S.vt });
+  return a;
+};
+const isCss = (a) => (typeof CSSAnimation !== 'undefined' && a instanceof CSSAnimation)
+  || (typeof CSSTransition !== 'undefined' && a instanceof CSSTransition);
+
+let playing = true;
+function seek(target, { freeze = false } = {}) {
+  target = clamp(Number(target) || 0, 0, TL.end);
+  for (const a of document.getAnimations()) if (!isCss(a)) a.cancel();
+  Math.random = makeRng(0x5eed);           // deterministic roulette reel
+  const savedAudio = hud.audio;
+  hud.audio = null;
+  seeking = true;
+  animLog.length = 0;
+  hud.reset();
+  resetSim();
+  hud.update(0, hudCtx());
+  const step = 1 / 60;
+  while (S.vt < target - 1e-9) {
+    const h = Math.min(step, target - S.vt);
+    advance(h);
+    hud.update(h, hudCtx());
+  }
+  seeking = false;
+  hud.audio = savedAudio;
+  // fast-forward every animation started during the replay to its virtual age
+  for (const { anim, vt } of animLog) {
+    if (anim.playState === 'idle') continue;
+    const age = (S.vt - vt) * 1000;
+    const end = anim.effect ? anim.effect.getComputedTiming().endTime : 0;
+    if (age >= end) anim.finish(); else anim.currentTime = age;
+  }
+  animLog.length = 0;
+  void document.body.offsetWidth;          // flush style so pending transitions exist…
+  for (const a of document.getAnimations()) if (typeof CSSTransition !== 'undefined' && a instanceof CSSTransition) a.finish();
+  setPlaying(!freeze);
+  if (freeze) for (const a of document.getAnimations()) a.pause();
+  lastNow = performance.now();
+  return state();
+}
+function state() {
+  return {
+    t: +S.vt.toFixed(3), raceState: race.state, raceTime: +race.time.toFixed(2), place: player.place, lap: player.lap,
+    item: player.item, count: player.itemCount, rolling: player.rolling, speedKmh: Math.round(player.speed * 3.6),
+    drift: player.drift.active ? player.drift.tier : -1, wrongWay: player.wrongWay, finished: player.finished,
+    places: karts.map((k) => `${k.id}:${k.place}`).join(' '),
+  };
+}
+
+// ------------------------------------------------------------------ backgrounds
+function paintScene(g, W, H) {
+  const hz = H * 0.45;
+  let gr = g.createLinearGradient(0, 0, 0, hz);
+  gr.addColorStop(0, '#2c8cf0'); gr.addColorStop(0.55, '#7cc6ff'); gr.addColorStop(1, '#d8f1ff');
+  g.fillStyle = gr; g.fillRect(0, 0, W, hz + 1);
+  const sx = W * 0.7, sy = H * 0.1;
+  gr = g.createRadialGradient(sx, sy, 0, sx, sy, H * 0.4);
+  gr.addColorStop(0, 'rgba(255,255,245,1)'); gr.addColorStop(0.07, 'rgba(255,252,225,0.95)');
+  gr.addColorStop(0.3, 'rgba(255,246,205,0.28)'); gr.addColorStop(1, 'rgba(255,246,205,0)');
+  g.fillStyle = gr; g.fillRect(0, 0, W, hz);
+  // bright clouds placed behind the lap counter and the item slot (worst case for contrast)
+  const cloud = (cx, cy, s) => {
+    g.fillStyle = '#ffffff';
+    for (const [dx, dy, r] of [[0, 0, 1], [0.95, 0.18, 0.78], [-0.95, 0.22, 0.72], [0.42, -0.5, 0.74], [-0.38, -0.38, 0.62], [1.7, 0.36, 0.5], [-1.7, 0.38, 0.46]]) {
+      g.beginPath(); g.arc(cx + dx * s, cy + dy * s, r * s, 0, TAU); g.fill();
+    }
+    g.fillStyle = 'rgba(160,190,225,0.35)';
+    g.fillRect(cx - 2.2 * s, cy + 0.62 * s, 4.4 * s, 0.25 * s);
+  };
+  cloud(W * 0.1, H * 0.1, H * 0.065); cloud(W * 0.9, H * 0.15, H * 0.06); cloud(W * 0.47, H * 0.07, H * 0.04); cloud(W * 0.3, H * 0.3, H * 0.03);
+  const ridge = (color, base, amp, seed, freq) => {
+    g.fillStyle = color; g.beginPath(); g.moveTo(0, hz);
+    for (let x = 0; x <= W; x += W / 160) {
+      const u = x / W;
+      const y = base - amp * (0.55 + 0.3 * Math.sin(u * freq + seed) + 0.15 * Math.sin(u * freq * 2.7 + seed * 3));
+      g.lineTo(x, y);
+    }
+    g.lineTo(W, hz + 1); g.lineTo(0, hz + 1); g.closePath(); g.fill();
+  };
+  ridge('#9dbbe0', hz, H * 0.14, 1.3, 7);
+  ridge('#6fae5f', hz, H * 0.06, 4.1, 11);
+  gr = g.createLinearGradient(0, hz, 0, H);
+  gr.addColorStop(0, '#6cbf55'); gr.addColorStop(1, '#3f9a38');
+  g.fillStyle = gr; g.fillRect(0, hz, W, H - hz);
+  const vx = W / 2, z0 = 2.2, k = (W * 0.52 * z0) / 9;
+  const yAt = (z) => hz + (H - hz) * (z0 / z);
+  const xAt = (lat, z) => vx + (lat * k) / z;
+  const quad = (lat0, lat1, za, zb, color) => {
+    g.fillStyle = color; g.beginPath();
+    g.moveTo(xAt(lat0, za), yAt(za)); g.lineTo(xAt(lat1, za), yAt(za));
+    g.lineTo(xAt(lat1, zb), yAt(zb)); g.lineTo(xAt(lat0, zb), yAt(zb)); g.closePath(); g.fill();
+  };
+  for (let z = z0, i = 0; z < 500; z += 5, i++) if (i % 2) quad(-200, 200, z, z + 5, 'rgba(255,255,255,0.07)');
+  gr = g.createLinearGradient(0, hz, 0, H);
+  gr.addColorStop(0, '#8a8f9c'); gr.addColorStop(1, '#565b68');
+  g.fillStyle = gr; g.beginPath();
+  g.moveTo(xAt(-9, z0), H); g.lineTo(xAt(9, z0), H); g.lineTo(vx, hz); g.closePath(); g.fill();
+  for (let z = z0, i = 0; z < 400; z += 2.5, i++) {
+    const c = i % 2 ? '#ffffff' : '#e8323c';
+    quad(-10.2, -9, z, z + 2.5, c); quad(9, 10.2, z, z + 2.5, c);
+  }
+  for (let z = 3, i = 0; z < 400; z += 7) quad(-0.16, 0.16, z, z + 3.5, '#f2f2f2');
+  for (let z = 12; z < 400; z += 7) { quad(-4.8, -4.6, z, z + 3.5, 'rgba(255,255,255,0.5)'); quad(4.6, 4.8, z, z + 3.5, 'rgba(255,255,255,0.5)'); }
+  // a stylised player kart seen from behind
+  const cx = W / 2, by = H * 0.955, s = H * 0.0021;
+  g.fillStyle = 'rgba(0,0,0,0.28)';
+  g.beginPath(); g.ellipse(cx, by + 4 * s, 120 * s, 16 * s, 0, 0, TAU); g.fill();
+  g.fillStyle = '#1b1b22';
+  for (const dx of [-82, 82]) { g.beginPath(); g.roundRect(cx + dx * s - 24 * s, by - 52 * s, 48 * s, 56 * s, 12 * s); g.fill(); }
+  g.fillStyle = (CHARS[pIdx] && CHARS[pIdx].cssColor) || '#ff7a1f';
+  g.beginPath(); g.roundRect(cx - 70 * s, by - 70 * s, 140 * s, 54 * s, 18 * s); g.fill();
+  g.fillStyle = 'rgba(255,255,255,0.25)';
+  g.beginPath(); g.roundRect(cx - 60 * s, by - 66 * s, 120 * s, 14 * s, 7 * s); g.fill();
+  g.fillStyle = '#ffd25a';
+  g.beginPath(); g.arc(cx, by - 104 * s, 30 * s, 0, TAU); g.fill();
+  g.fillStyle = '#333';
+  for (const dx of [-30, 30]) { g.beginPath(); g.roundRect(cx + dx * s - 9 * s, by - 26 * s, 18 * s, 14 * s, 4 * s); g.fill(); }
+}
+
+function makePaintBg(kind) {
+  const canvas = document.getElementById('game');
+  const g = canvas.getContext('2d');
+  const draw = () => {
+    const dpr = Math.min(devicePixelRatio || 1, 2);
+    const W = (canvas.width = Math.round(innerWidth * dpr)), H = (canvas.height = Math.round(innerHeight * dpr));
+    if (kind === 'white') { g.fillStyle = '#f7f9ff'; g.fillRect(0, 0, W, H); return; }
+    if (kind === 'dark') { g.fillStyle = '#0d0f17'; g.fillRect(0, 0, W, H); return; }
+    paintScene(g, W, H);
+  };
+  addEventListener('resize', draw);
+  draw();
+  return { render() {} };
+}
+
+async function makeWorldBg() {
+  const { buildWorld } = await import('../js/world.js');
+  const canvas = document.getElementById('game');
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.toneMapping = THREE.ACESFilmicToneMapping;
+  renderer.shadowMap.enabled = true;
+  renderer.shadowMap.type = THREE.PCFShadowMap;   // r186: PCFSoft was removed
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(70, 1, 0.1, 2400);
+  const world = buildWorld(scene, track, { renderer, quality: 'high' });
+  const views = [];
+  if (charsMod && charsMod.buildKartModel) {
+    for (const k of karts) { const m = charsMod.buildKartModel(k.character); scene.add(m); views.push([k, m]); }
+  }
+  const resize = () => {
+    renderer.setSize(innerWidth, innerHeight, false);
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+  };
+  addEventListener('resize', resize);
+  resize();
+  const fwd = new THREE.Vector3(), look = new THREE.Vector3();
+  return {
+    render(dt) {
+      for (const [k, m] of views) { m.position.copy(k.position); m.rotation.y = k.yaw; }
+      const yaw = player.yaw;
+      fwd.set(Math.sin(yaw), 0, Math.cos(yaw));
+      camera.position.copy(player.position).addScaledVector(fwd, -6.5);
+      camera.position.y = Math.max(camera.position.y + 2.6, track.heightAt(camera.position) + 1);
+      look.copy(player.position).addScaledVector(fwd, 5);
+      look.y += 1.1;
+      camera.lookAt(look);
+      world.update(dt, player.position, camera);
+      renderer.render(scene, camera);
+    },
+  };
+}
+
+let bg;
+const bgKind = params.get('bg') || 'paint';
+if (bgKind === 'world') {
+  try { bg = await makeWorldBg(); } catch (err) {
+    console.warn('[hud sandbox] 3D world background failed, using the painted one:', err.message);
+    bg = makePaintBg('paint');
+  }
+} else {
+  bg = makePaintBg(bgKind);
+}
+
+// ------------------------------------------------------------------ live loop + dev bar
+const bar = document.getElementById('devbar');
+const tLabel = document.createElement('span');
+tLabel.className = 't';
+const playBtn = document.createElement('button');
+const scrub = Object.assign(document.createElement('input'), { type: 'range', min: 0, max: TL.end, step: 0.05, value: 0 });
+const soundBtn = document.createElement('button');
+soundBtn.textContent = 'sound';
+soundBtn.onclick = () => {
+  soundOn = !soundOn;
+  soundBtn.classList.toggle('on', soundOn);
+  if (soundOn) { audio.unlock(); if (race.state === 'racing') audio.startMusic('race'); } else audio.stopMusic();
+};
+function setPlaying(b) { playing = b; playBtn.textContent = b ? 'pause' : 'play'; }
+playBtn.onclick = () => {
+  setPlaying(!playing);
+  for (const a of document.getAnimations()) playing ? a.play() : a.pause();
+};
+scrub.oninput = () => seek(Number(scrub.value), { freeze: true });
+bar.append(playBtn, tLabel, scrub, soundBtn);
+for (const [name, t] of Object.entries(MOMENTS)) {
+  const b = document.createElement('button');
+  b.textContent = name;
+  b.onclick = () => seek(t, { freeze: true });
+  bar.appendChild(b);
+}
+
+let lastNow = performance.now();
+function frame(now) {
+  const dt = Math.min(0.1, Math.max(0, (now - lastNow) / 1000));
+  lastNow = now;
+  if (playing) {
+    if (S.vt >= TL.end) { seek(0); if (soundOn) audio.stopMusic(); }
+    advance(dt);
+    hud.update(dt, hudCtx());
+    if (soundOn) {
+      audio.updateEngine(dt, {
+        speed: player.speed, maxSpeed: player.stats.topSpeed, throttle: race.state === 'racing' ? 1 : 0,
+        drifting: player.drift.active, boosting: player.boostTimer > 0 || player.starTimer > 0,
+        grounded: true, offroad: false, active: true,
+      });
+    }
+  }
+  bg.render(dt);
+  tLabel.textContent = S.vt.toFixed(2);
+  if (document.activeElement !== scrub) scrub.value = S.vt;
+  requestAnimationFrame(frame);
+}
+
+// ------------------------------------------------------------------ automated checks
+// A second, private HUD instance is driven with hand-made states and every
+// visible result is asserted from the DOM / canvas.
+function runChecks() {
+  const results = [];
+  const check = (name, ok, detail = '') => results.push({ name, ok: !!ok, detail: String(detail || '') });
+  const box = document.createElement('div');
+  box.style.cssText = 'position:fixed;inset:0;visibility:hidden;pointer-events:none;z-index:-1';
+  document.body.appendChild(box);
+  const h = new HUD(box);
+  const q = (sel) => box.querySelector(sel);
+  const txt = (sel) => (q(sel) ? q(sel).textContent : null);
+  const has = (sel, cls) => !!q(sel) && q(sel).classList.contains(cls);
+  const F = 1 / 60;
+
+  // robustness: missing / invalid arguments never throw
+  let err = null;
+  try {
+    h.update();
+    h.update(NaN, {});
+    h.update(F, { player: null, race: null, karts: null });
+    h.update(-1, { karts: [null, {}, { position: null }] });
+    h.countdown(7); h.countdown(-2); h.flash(''); h.flash(42, { size: 'tiny', duration: -3 });
+    h.showFinish(NaN); h.setWrongWay('yes'); h.setTrack(null); h.show();
+    h.update(F, { karts: [null, {}, { position: null }, { position: { x: NaN, y: 0, z: 0 } }] });
+    h.reset(); h.hide();
+  } catch (e) { err = e; }
+  check('API tolerates missing / invalid arguments', !err, err && err.stack);
+  check('place badge hidden without a player', q('.hud-place').style.visibility === 'hidden');
+
+  h.setTrack(track);
+  h.show();
+  const P = {
+    isPlayer: true, character: { cssColor: '#ff7a1f' }, position: track.pointAt(0, 0), yaw: 0, stats: { topSpeed: 29 },
+    speed: 20, lap: 2, place: 3, finished: false, finishTime: null, lapTimes: [], boostTimer: 0, starTimer: 0,
+    drift: { active: false, dir: 0, charge: 0, tier: 0 }, item: null, itemCount: 0, rolling: false, rollTimer: 0,
+  };
+  const R = { state: 'racing', time: 42.123, laps: 3 };
+  const C = { player: P, race: R, karts: [...cpus, P], phoneConnected: true };
+  h.update(F, C);
+  check('lap counter "2/3"', txt('.hud-lap-num') === '2' && txt('.hud-lap-total') === '/3');
+  check('race timer m:ss.cc', txt('.hud-timer') === '0:42.12', txt('.hud-timer'));
+  check('speed in km/h', txt('.hud-speed-num') === '72', txt('.hud-speed-num'));
+  check('phone badge shown', has('.hud-phone', 'on'));
+  const expanded = has('.hud-phone', 'expanded') && txt('.hud-phone-text') === 'PHONE CONNECTED';
+  for (let i = 0; i < 250; i++) h.update(F, C);                 // > 4 s
+  const collapsed = has('.hud-phone', 'on') && !has('.hud-phone', 'expanded');
+  C.phoneConnected = false; h.update(F, C);
+  const lost = has('.hud-phone', 'on') && has('.hud-phone', 'lost') && txt('.hud-phone-text') === 'PHONE DISCONNECTED';
+  for (let i = 0; i < 220; i++) h.update(F, C);                 // > 3.5 s
+  const gone = !has('.hud-phone', 'on');
+  C.phoneConnected = true; h.update(F, C);
+  const back = has('.hud-phone', 'on') && has('.hud-phone', 'expanded') && !has('.hud-phone', 'lost');
+  check('phone badge: announces, collapses, warns on loss, recovers', expanded && collapsed && lost && gone && back,
+    JSON.stringify({ expanded, collapsed, lost, gone, back }));
+  const got = [];
+  for (let p = 1; p <= 8; p++) {
+    P.place = p; h.update(F, C);
+    got.push(txt('.hud-place-num .olt-front') + txt('.hud-place-suf .olt-front'));
+  }
+  check('place ordinals 1st..8th', got.join() === '1st,2nd,3rd,4th,5th,6th,7th,8th', got.join(' '));
+  P.place = 1; h.update(F, C);
+  const gold = has('.hud-place', 'p1') && /#ffc21a/.test(q('.hud-place-num').style.getPropertyValue('--fill'));
+  P.place = 2; h.update(F, C); const silver = has('.hud-place', 'p2');
+  P.place = 3; h.update(F, C); const bronze = has('.hud-place', 'p3');
+  P.place = 6; h.update(F, C);
+  const plain = !['p1', 'p2', 'p3'].some((c) => has('.hud-place', c));
+  check('1st gold / 2nd silver / 3rd bronze / others plain', gold && silver && bronze && plain);
+
+  P.lap = 3; h.update(F, C);
+  check('final lap styling on lap 3/3', has('.hud-lap', 'final'));
+  P.finished = true; P.finishTime = 95.5; R.time = 99; h.update(F, C);
+  check('timer freezes at the finish time', txt('.hud-timer') === '1:35.50', txt('.hud-timer'));
+  check('final lap styling off once finished', !has('.hud-lap', 'final'));
+  P.finished = false; P.finishTime = null; P.lap = 2; R.time = 50;
+  P.lapTimes = [31.5]; h.update(F, C);
+  const split1 = has('.hud-split', 'on') && !has('.hud-split', 'best') && /0:31\.50/.test(txt('.hud-split'));
+  P.lapTimes = [31.5, 30.25]; h.update(F, C);
+  check('lap split shown, best lap highlighted', split1 && has('.hud-split', 'best') && /LAP 2\s+0:30\.25/.test(txt('.hud-split')), txt('.hud-split'));
+
+  // roulette: the reel ticks fast, slows down, then the item lands with a pop
+  const ticks = [];
+  let vt = 0;
+  const offTick = bus.on('hud:rouletteTick', (e) => ticks.push({ t: vt, p: e.progress }));
+  P.rolling = true; P.rollTimer = ITEM.rouletteSeconds;
+  let rollingClass = true;
+  const icons = new Set(ITEM_IDS.map((id) => ITEM_INFO[id].icon));
+  let iconsOk = true;
+  while (P.rollTimer > 0) {
+    h.update(F, C);
+    rollingClass = rollingClass && has('.hud-item', 'rolling');
+    iconsOk = iconsOk && icons.has(txt('.hud-item-icon'));
+    vt += F; P.rollTimer = Math.max(0, P.rollTimer - F);
+  }
+  offTick();
+  const gaps = ticks.slice(1).map((k, i) => k.t - ticks[i].t);
+  const avg = (a) => a.reduce((x, y) => x + y, 0) / Math.max(1, a.length);
+  const early = avg(gaps.slice(0, 5)), late = avg(gaps.slice(-3));
+  check('roulette reel cycles item icons and slows down', rollingClass && iconsOk && ticks.length >= 12 && late > early * 2.5,
+    `${ticks.length} ticks, gaps ${(early * 1000).toFixed(0)} ms → ${(late * 1000).toFixed(0)} ms`);
+  P.rolling = false; P.item = 'triple_toot'; P.itemCount = 3; h.update(F, C);
+  check('item lands: icon, ×3 badge, name', !has('.hud-item', 'rolling') && has('.hud-item', 'has')
+    && txt('.hud-item-icon') === ITEM_INFO.triple_toot.icon && has('.hud-item-count', 'on') && txt('.hud-item-count') === '×3'
+    && has('.hud-item-name', 'on') && txt('.hud-item-name') === ITEM_INFO.triple_toot.name);
+  P.itemCount = 2; h.update(F, C);
+  const c2 = has('.hud-item-count', 'on') && txt('.hud-item-count') === '×2';
+  P.itemCount = 1; h.update(F, C);
+  check('count badge ×2, hidden on the last use', c2 && !has('.hud-item-count', 'on'));
+  P.item = null; P.itemCount = 0; h.update(F, C);
+  check('using the item clears the slot', h._item.shown === null && !has('.hud-item-count', 'on'));
+  P.item = 'star'; P.itemCount = 1; h.update(F, C);
+  check('an item given without a roulette shows directly', txt('.hud-item-icon') === ITEM_INFO.star.icon && h._item.shown === 'star');
+  P.item = null; P.itemCount = 0; h.update(F, C);
+
+  // drift charge
+  Object.assign(P.drift, { active: true, charge: 1.2, tier: 1 }); h.update(F, C);
+  const segs = [...box.querySelectorAll('.hud-drift-seg i')].map((i) => i.style.transform);
+  check('drift tier 1: MINI label + segment fills', has('.hud-drift', 'on') && txt('.hud-drift-label') === 'MINI'
+    && segs[0] === 'scaleX(1)' && segs[1] === 'scaleX(0.34)' && segs[2] === 'scaleX(0)', segs.join(' '));
+  Object.assign(P.drift, { charge: 3.6, tier: 3 }); h.update(F, C);
+  check('drift tier 3: ULTRA in the tier color', txt('.hud-drift-label') === 'ULTRA' && has('.hud-drift', 'charged')
+    && q('.hud-drift').style.getPropertyValue('--tier') === DRIFT.tierColors[3]);
+  P.drift.active = false; h.update(F, C);
+  check('drift indicator hides on release', !has('.hud-drift', 'on'));
+
+  // speedometer modes
+  P.speed = 0; h.update(F, C);
+  const zero = has('.hud-speed', 'zero');
+  P.speed = 25; P.boostTimer = 1; h.update(F, C);
+  const boost = has('.hud-speed', 'boosting') && !has('.hud-speed', 'zero') && q('.hud-speed-val').getAttribute('stroke').includes('hudBoost');
+  P.starTimer = 3; h.update(F, C);
+  const star = has('.hud-speed', 'star') && q('.hud-speed-val').getAttribute('stroke').includes('hudStar');
+  P.boostTimer = 0; P.starTimer = 0; h.update(F, C);
+  const normal = !has('.hud-speed', 'boosting') && !has('.hud-speed', 'star') && q('.hud-speed-val').getAttribute('stroke').includes('hudSpd');
+  check('speed arc: zero / boost / star / normal', zero && boost && star && normal);
+
+  // minimap: outline drawn and the player dot in the character color
+  P.position = track.pointAt(120, 0); P.yaw = track.frameAt(120).yaw; h.update(F, C);
+  const cv = q('.hud-map-canvas');
+  const img = cv.getContext('2d').getImageData(0, 0, cv.width, cv.height).data;
+  let opaque = 0;
+  for (let i = 3; i < img.length; i += 4) if (img[i] > 0) opaque++;
+  const xf = h._mapXf;
+  const mx = Math.round(xf.ox + (P.position.x * xf.c - P.position.z * xf.s) * xf.scale);
+  const my = Math.round(xf.oy + (P.position.x * xf.s + P.position.z * xf.c) * xf.scale);
+  const k = (my * cv.width + mx) * 4, rgb = [img[k], img[k + 1], img[k + 2]];
+  const fill = opaque / (cv.width * cv.height);
+  check('minimap: track outline + player dot in character color', cv.width > 50 && fill > 0.08
+    && Math.abs(rgb[0] - 0xff) < 30 && Math.abs(rgb[1] - 0x7a) < 30 && Math.abs(rgb[2] - 0x1f) < 30,
+    `${cv.width}x${cv.height}, ${(fill * 100).toFixed(0)}% drawn, dot rgb(${rgb})`);
+
+  // center overlays
+  h.countdown(3);
+  const c3 = txt('.hud-count-text .olt-front') === '3' && has('.hud-count', 'on') && !has('.hud-count', 'go');
+  h.countdown(0);
+  check('countdown 3 … GO!', c3 && txt('.hud-count-text .olt-front') === 'GO!' && has('.hud-count', 'go'));
+  h.flash('LAP 2', { size: 'medium', color: '#38c8ff' });
+  check('flash(): text + size', txt('.hud-flash-text .olt-front') === 'LAP 2' && has('.hud-flash', 'on') && has('.hud-flash', 'medium'));
+  h.setWrongWay(true);
+  const ww = has('.hud-wrong', 'on');
+  h.setWrongWay(false);
+  check('setWrongWay() toggles the warning', ww && !has('.hud-wrong', 'on'));
+  P.finished = true; P.finishTime = 95.5; h.update(F, C);
+  h.showFinish(2);
+  check('showFinish(2): place, time, podium glow', has('.hud-finish', 'on') && has('.hud-finish', 'podium')
+    && txt('.hud-finish-place .olt-front') === '2nd' && txt('.hud-finish-time') === '1:35.50');
+  h.showFinish(6);
+  check('showFinish(6): plain, no podium', !has('.hud-finish', 'podium') && txt('.hud-finish-place .olt-front') === '6th');
+  h.reset();
+  const stillOn = ['.hud-count', '.hud-flash', '.hud-wrong', '.hud-finish', '.hud-item-count', '.hud-drift', '.hud-split'].filter((s) => has(s, 'on'));
+  check('reset() clears every overlay', stillOn.length === 0 && !has('.hud-item', 'has'), stillOn.join());
+  h.hide();
+  const hidden = has('.hud', 'hud--hidden');
+  h.show();
+  check('hide() / show()', hidden && !has('.hud', 'hud--hidden'));
+
+  // DOM economy: in a steady state only the clock text may change each frame
+  P.finished = false; P.finishTime = null; P.speed = 25; P.place = 4; P.lap = 2; P.item = 'banana'; P.itemCount = 1;
+  for (let i = 0; i < 300; i++) { R.time += F; h.update(F, C); }   // let name / split timers expire
+  const mo = new MutationObserver(() => {});
+  mo.observe(box, { subtree: true, childList: true, attributes: true, characterData: true });
+  for (let i = 0; i < 120; i++) { R.time += F; h.update(F, C); }
+  const muts = {};
+  for (const m of mo.takeRecords()) {
+    const node = m.target.nodeType === 3 ? m.target.parentElement : m.target;
+    const cls = typeof node.className === 'string' ? node.className : node.getAttribute('class');
+    const key = `${m.type}:${cls || node.tagName}`;
+    muts[key] = (muts[key] || 0) + 1;
+  }
+  mo.disconnect();
+  const keys = Object.keys(muts);
+  check('steady state: only the clock text touches the DOM', keys.length === 1 && keys[0] === 'characterData:hud-timer'
+    && muts[keys[0]] <= 120, JSON.stringify(muts));
+
+  // cost per update (8 karts, minimap redraw included)
+  const N = 3000, t0 = performance.now();
+  for (let i = 0; i < N; i++) { R.time += F; h.update(F, C); }
+  const per = (performance.now() - t0) / N;
+  check('update() cost per frame < 0.25 ms', per < 0.25, `${(per * 1000).toFixed(1)} µs`);
+
+  h.dispose();
+  check('dispose() removes the HUD DOM', box.childElementCount === 0);
+  box.remove();
+
+  const failed = results.filter((r) => !r.ok);
+  const lines = results.map((r) => `${r.ok ? 'PASS' : 'FAIL'}  ${r.name}${r.detail ? '  — ' + r.detail : ''}`);
+  console.log(`${lines.join('\n')}\n${results.length - failed.length}/${results.length} HUD checks passed`);
+  return { passed: results.length - failed.length, total: results.length, failed: failed.map((f) => `${f.name}: ${f.detail}`) };
+}
+
+resetSim();
+await document.fonts.ready;
+if (params.has('t')) seek(Number(params.get('t')), { freeze: params.has('freeze') });
+else seek(0);
+requestAnimationFrame(frame);
+
+window.hudTest = { seek, state, runChecks, moments: MOMENTS, timeline: TL, hud, player, karts, race,
+  play: () => setPlaying(true), pause: () => setPlaying(false) };
+window.__ready = true;
+</script>
+</body>
+</html>

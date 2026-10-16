@@ -1,0 +1,427 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<link rel="icon" href="data:,">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KRISHIV KART — audio sandbox</title>
+<script type="importmap">{"imports":{"three":"/vendor/three/build/three.module.js","three/addons/":"/vendor/three/examples/jsm/"}}</script>
+<style>
+  body { margin: 0; background: #12101c; color: #e8e6f5; font: 13px/1.4 system-ui, sans-serif; }
+  header { padding: 10px 14px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; border-bottom: 1px solid #2a2640; }
+  h1 { font-size: 16px; margin: 0 12px 0 0; }
+  button { background: #2c2750; color: #fff; border: 1px solid #4a4380; border-radius: 6px; padding: 5px 9px; cursor: pointer; font: inherit; }
+  button:hover { background: #3c3470; }
+  #pads { padding: 10px 14px; display: flex; flex-wrap: wrap; gap: 6px; }
+  #report { padding: 0 14px; white-space: pre; font: 11px/1.35 ui-monospace, Menlo, monospace; }
+  #grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; padding: 10px 14px; }
+  .tile { background: #000; border-radius: 4px; overflow: hidden; position: relative; }
+  .tile canvas { display: block; width: 100%; height: 92px; }
+  .tile b { position: absolute; left: 5px; top: 3px; font-size: 11px; color: #fff; text-shadow: 0 1px 2px #000; }
+  .tile i { position: absolute; right: 5px; top: 3px; font-size: 10px; font-style: normal; color: #bbb; text-shadow: 0 1px 2px #000; }
+  .wide { grid-column: span 3; }
+  .wide canvas { height: 120px; }
+  label { display: inline-flex; gap: 6px; align-items: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Audio sandbox</h1>
+  <button id="unlock">Unlock audio</button>
+  <button data-music="menu">Menu music</button>
+  <button data-music="race">Race music</button>
+  <button id="final">Final lap intensity</button>
+  <button id="stop">Stop music</button>
+  <button data-jingle="start">Jingle: start</button>
+  <button data-jingle="finish">Jingle: finish</button>
+  <button data-jingle="lose">Jingle: lose</button>
+  <label><input type="checkbox" id="eng"> engine sim</label>
+  <label>speed <input type="range" id="spd" min="0" max="40" value="0"></label>
+  <label><input type="checkbox" id="drift"> drift</label>
+  <label><input type="checkbox" id="off"> offroad</label>
+  <label><input type="checkbox" id="boost"> boost</label>
+  <button id="run">Run offline tests</button>
+</header>
+<div id="pads"></div>
+<div id="grid"></div>
+<div id="report"></div>
+<script type="module">
+import {
+  AudioEngine, SOUNDS, SOUND_NAMES, buildMasterChain, getSong, SONG_KINDS, songStepDuration,
+  songLoopDuration, createMusicRig, scheduleMusicStep, EngineLoops,
+} from '../js/audio.js';
+
+const audio = new AudioEngine();
+window.audio = audio;
+const $ = (s) => document.querySelector(s);
+
+// ------------------------------------------------------------- manual UI
+for (const name of [...SOUND_NAMES, 'jingleStart']) {
+  const b = document.createElement('button');
+  b.textContent = name;
+  b.onclick = () => { audio.unlock(); audio.play(name, { pitch: 1 }); };
+  $('#pads').appendChild(b);
+}
+$('#unlock').onclick = () => audio.unlock();
+document.querySelectorAll('[data-music]').forEach((b) => (b.onclick = () => { audio.unlock(); audio.startMusic(b.dataset.music); }));
+document.querySelectorAll('[data-jingle]').forEach((b) => (b.onclick = () => { audio.unlock(); audio.playJingle(b.dataset.jingle); }));
+$('#final').onclick = () => audio.setMusicIntensity(1);
+$('#stop').onclick = () => audio.stopMusic();
+let last = performance.now();
+function loop(now) {
+  const dt = (now - last) / 1000; last = now;
+  const speed = Number($('#spd').value);
+  audio.updateEngine(dt, {
+    speed, maxSpeed: $('#boost').checked ? 38 : 29, throttle: speed > 0 ? 1 : 0, drifting: $('#drift').checked,
+    boosting: $('#boost').checked, grounded: true, offroad: $('#off').checked, active: $('#eng').checked,
+  });
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+// ------------------------------------------------------------- analysis helpers
+function stats(buf, from = 0, to = buf.length) {
+  const chans = [];
+  for (let c = 0; c < buf.numberOfChannels; c++) chans.push(buf.getChannelData(c));
+  let peak = 0, sum = 0, n = 0, lastLoud = 0, firstLoud = -1, nan = 0;
+  for (let i = from; i < to; i++) {
+    for (const d of chans) {
+      const v = d[i];
+      if (!Number.isFinite(v)) { nan++; continue; }
+      const a = Math.abs(v);
+      if (a > peak) peak = a;
+      sum += v * v; n++;
+      if (a > 0.003) { lastLoud = i; if (firstLoud < 0) firstLoud = i; }
+    }
+  }
+  return { peak, rms: Math.sqrt(sum / Math.max(1, n)), audibleFrom: firstLoud / buf.sampleRate, audibleTo: lastLoud / buf.sampleRate, nan };
+}
+const db = (v) => (v > 0 ? 20 * Math.log10(v) : -Infinity);
+
+// windowed RMS of the loudest 50 ms (perceived loudness proxy)
+function loudest50(buf) {
+  const d0 = buf.getChannelData(0), d1 = buf.getChannelData(buf.numberOfChannels > 1 ? 1 : 0);
+  const w = Math.floor(buf.sampleRate * 0.05);
+  let best = 0, acc = 0;
+  for (let i = 0; i < buf.length; i++) {
+    const v = (d0[i] * d0[i] + d1[i] * d1[i]) / 2;
+    acc += v;
+    if (i >= w) { const u = (d0[i - w] * d0[i - w] + d1[i - w] * d1[i - w]) / 2; acc -= u; }
+    if (acc > best) best = acc;
+  }
+  return Math.sqrt(best / w);
+}
+
+// radix-2 FFT magnitude (in place on re/im)
+function fft(re, im) {
+  const n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) { [re[i], re[j]] = [re[j], re[i]]; [im[i], im[j]] = [im[j], im[i]]; }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    const ang = (-2 * Math.PI) / len, wr = Math.cos(ang), wi = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let cr = 1, ci = 0;
+      for (let k = 0; k < len / 2; k++) {
+        const ar = re[i + k], ai = im[i + k];
+        const br = re[i + k + len / 2] * cr - im[i + k + len / 2] * ci;
+        const bi = re[i + k + len / 2] * ci + im[i + k + len / 2] * cr;
+        re[i + k] = ar + br; im[i + k] = ai + bi;
+        re[i + k + len / 2] = ar - br; im[i + k + len / 2] = ai - bi;
+        const t = cr * wr - ci * wi; ci = cr * wi + ci * wr; cr = t;
+      }
+    }
+  }
+}
+
+function colormap(t) {
+  t = Math.max(0, Math.min(1, t));
+  const r = Math.min(255, 255 * Math.min(1, t * 2.2));
+  const g = 255 * Math.max(0, Math.min(1, (t - 0.35) * 1.9));
+  const b = 255 * Math.max(0, Math.min(1, 0.5 - Math.abs(t - 0.25) * 2.4 + Math.max(0, t - 0.85) * 5));
+  return [r, g, b];
+}
+
+// Spectrogram (log-frequency 50 Hz..16 kHz) + waveform overlay into a tile.
+function drawTile(label, info, buf, seconds, wide = false) {
+  const tile = document.createElement('div');
+  tile.className = 'tile' + (wide ? ' wide' : '');
+  const cv = document.createElement('canvas');
+  const W = wide ? 720 : 240, H = wide ? 120 : 92;
+  cv.width = W; cv.height = H;
+  tile.append(cv);
+  const b = document.createElement('b'); b.textContent = label;
+  const i = document.createElement('i'); i.textContent = info;
+  tile.append(b, i);
+  $('#grid').appendChild(tile);
+  const g = cv.getContext('2d');
+  const img = g.createImageData(W, H);
+  const d = buf.getChannelData(0), sr = buf.sampleRate;
+  const N = 1024;
+  const total = Math.min(buf.length, Math.floor(seconds * sr));
+  const re = new Float32Array(N), im = new Float32Array(N);
+  const fmin = 50, fmax = 16000;
+  for (let x = 0; x < W; x++) {
+    const start = Math.floor((x / W) * total) - N / 2;
+    for (let k = 0; k < N; k++) {
+      const idx = start + k;
+      const w = 0.5 - 0.5 * Math.cos((2 * Math.PI * k) / (N - 1));
+      re[k] = idx >= 0 && idx < d.length ? d[idx] * w : 0;
+      im[k] = 0;
+    }
+    fft(re, im);
+    for (let y = 0; y < H; y++) {
+      const f = fmin * Math.pow(fmax / fmin, 1 - y / (H - 1));
+      const bin = Math.min(N / 2 - 1, Math.round((f / sr) * N));
+      const mag = Math.hypot(re[bin], im[bin]) / (N / 4);
+      const t = (db(mag) + 80) / 80;
+      const [r, gg, bb] = colormap(t);
+      const o = (y * W + x) * 4;
+      img.data[o] = r; img.data[o + 1] = gg; img.data[o + 2] = bb; img.data[o + 3] = 255;
+    }
+  }
+  g.putImageData(img, 0, 0);
+  // waveform envelope
+  g.strokeStyle = 'rgba(120,255,160,0.75)';
+  g.beginPath();
+  for (let x = 0; x < W; x++) {
+    const a = Math.floor((x / W) * total), z = Math.floor(((x + 1) / W) * total);
+    let m = 0;
+    for (let k = a; k < z; k++) m = Math.max(m, Math.abs(d[k]));
+    const y = H - 2 - m * (H - 4);
+    x ? g.lineTo(x, y) : g.moveTo(x, y);
+  }
+  g.stroke();
+}
+
+async function renderSound(name, { pitch = 1, limiter = true, seconds = 4, sr = 44100 } = {}) {
+  const ctx = new OfflineAudioContext(2, Math.floor(sr * seconds), sr);
+  const chain = buildMasterChain(ctx, { limiter });
+  chain.output.connect(ctx.destination);
+  const dur = SOUNDS[name](ctx, chain.sfx, { when: 0.02, pitch });
+  const buf = await ctx.startRendering();
+  return { buf, dur };
+}
+
+// Render `loops` loops of a song through the master chain (offline).
+// Sample rate (~22-30 kHz) at which one loop is a whole number of 128-frame
+// render quanta, so both loops render bit-identically in Chrome.
+function quantumAlignedRate(T) {
+  for (let sr = 22050; sr <= 32000; sr++) {
+    const f = sr * T, r = Math.round(f);
+    if (Math.abs(f - r) < 1e-4 && r % 128 === 0) return sr;
+  }
+  return 22050;
+}
+
+async function renderSong(kind, intensity, loops, srIn = 0, tail = 1.5) {
+  const song = getSong(kind);
+  const sd = songStepDuration(song, intensity);
+  const T = songLoopDuration(song, intensity);
+  const sr = srIn || quantumAlignedRate(T);
+  const t0 = 0.05;
+  const ctx = new OfflineAudioContext(2, Math.floor(sr * (T * loops + tail)), sr);
+  const chain = buildMasterChain(ctx);
+  chain.output.connect(ctx.destination);
+  const rig = createMusicRig(ctx, chain.music);
+  rig.setTempo(sd, 0);
+  const steps = song.totalSteps * loops;
+  for (let k = 0; k < steps; k++) scheduleMusicStep(rig, song, k % song.totalSteps, t0 + k * sd, sd, intensity);
+  const buf = await ctx.startRendering();
+  return { buf, T, sd, t0, song };
+}
+
+// Pearson correlation between [a, a+len) and [a+lag, a+lag+len) of an array.
+function pearson(x, a, lag, len) {
+  let su = 0, sv = 0;
+  for (let i = 0; i < len; i++) { su += x[a + i]; sv += x[a + lag + i]; }
+  const mu = su / len, mv = sv / len;
+  let sxy = 0, sxx = 0, syy = 0;
+  for (let i = 0; i < len; i++) {
+    const u = x[a + i] - mu, v = x[a + lag + i] - mv;
+    sxy += u * v; sxx += u * u; syy += v * v;
+  }
+  return sxy / Math.sqrt(sxx * syy + 1e-12);
+}
+
+// Log-RMS loudness envelope: 3 ms windows every 1 ms. (Raw waveforms are not
+// bit-identical between loops in Chrome — oscillator phase depends slightly on
+// where a note starts inside a 128-frame render quantum — but the envelope of a
+// correctly looping song repeats exactly.)
+function envelope(buf, hopSec = 0.001) {
+  const sr = buf.sampleRate, a0 = buf.getChannelData(0), a1 = buf.getChannelData(1);
+  const hop = Math.max(1, Math.round(sr * hopSec)), win = hop * 3;
+  const n = Math.floor((buf.length - win) / hop);
+  const env = new Float32Array(n);
+  for (let k = 0; k < n; k++) {
+    let s = 0;
+    for (let i = k * hop, e = i + win; i < e; i++) s += a0[i] * a0[i] + a1[i] * a1[i];
+    env[k] = Math.log(1e-5 + Math.sqrt(s / (2 * win)));
+  }
+  return { env, rate: sr / hop };
+}
+
+// Measure the loop period from the envelope's correlation peak near the expected length.
+function measureLoop(buf, Texp) {
+  const { env, rate } = envelope(buf);
+  const start = Math.round(1.0 * rate);
+  const len = Math.round(Math.min(10, Texp - 1.2) * rate);
+  const center = Math.round(Texp * rate), span = Math.round(0.3 * rate);
+  let best = -2, bestLag = center;
+  const corrAt = new Map();
+  for (let lag = center - span; lag <= center + span; lag++) {
+    const c = pearson(env, start, lag, len);
+    corrAt.set(lag, c);
+    if (c > best) { best = c; bestLag = lag; }
+  }
+  // parabolic interpolation for sub-hop precision
+  const y0 = corrAt.get(bestLag - 1) ?? best, y2 = corrAt.get(bestLag + 1) ?? best;
+  const den = y0 - 2 * best + y2;
+  const frac = den !== 0 ? 0.5 * (y0 - y2) / den : 0;
+  const measured = (bestLag + frac) / rate;
+  // seam check: the whole second loop against the first (skipping the first
+  // second, which has no echo tail from a previous loop)
+  const seamEnv = pearson(env, start, Math.round(Texp * rate), Math.round((Texp - 1.1) * rate));
+  // raw-sample seam: loop 2 vs loop 1, sample by sample
+  const sr = buf.sampleRate, a0 = buf.getChannelData(0);
+  const seam = pearson(a0, Math.round(1.0 * sr), Math.round(Texp * sr), Math.round((Texp - 1.1) * sr));
+  // sanity: half a beat off must correlate clearly worse
+  const off = pearson(env, start, center + Math.round(0.11 * rate), len);
+  return { measured, corr: best, seam, seamEnv, offBeatCorr: off };
+}
+
+async function engineOffline() {
+  const sr = 44100, seconds = 6.5;
+  const ctx = new OfflineAudioContext(2, sr * seconds, sr);
+  const chain = buildMasterChain(ctx);
+  chain.output.connect(ctx.destination);
+  const eng = new EngineLoops(ctx, chain.sfx);
+  const dt = 1 / 60;
+  const scenario = (t) => {
+    const s = { speed: 0, maxSpeed: 29, throttle: 0, drifting: false, boosting: false, grounded: true, offroad: false };
+    if (t < 0.5) return s;                                   // idle
+    if (t < 1.0) { s.throttle = 1; return s; }               // revving on the grid
+    if (t < 4.2) { s.throttle = 1; s.speed = Math.min(29, 29 * (1 - Math.exp(-(t - 1.0) * 1.1))); }
+    if (t >= 2.4 && t < 3.3) s.drifting = true;
+    if (t >= 3.5 && t < 4.2) { s.offroad = true; s.maxSpeed = 14.5; s.speed = Math.max(14.5, s.speed * 0.7); }
+    if (t >= 4.2 && t < 5.1) { s.throttle = 1; s.boosting = true; s.maxSpeed = 38; s.speed = Math.min(38, 22 + (t - 4.2) * 25); }
+    if (t >= 5.1) { s.throttle = 0; s.speed = Math.max(0, 38 - (t - 5.1) * 18); }
+    return s;
+  };
+  for (let k = 1; k < seconds * 60 - 2; k++) {
+    const t = k * dt;
+    ctx.suspend(t).then(() => { eng.update(dt, scenario(t), true); ctx.resume(); });
+  }
+  const buf = await ctx.startRendering();
+  return buf;
+}
+
+// ------------------------------------------------------------- the test run
+async function runAudioTests() {
+  $('#grid').innerHTML = '';
+  const lines = [];
+  const results = { sounds: {}, failures: [] };
+  lines.push('sound          dur(s)  audible(s)  peak    peak(dB)  rms(dB)  loud50(dB)  preLimPeak  pitch0.7/1.4 peak');
+  for (const name of SOUND_NAMES.concat(['jingleStart'])) {
+    const { buf, dur } = await renderSound(name);
+    const st = stats(buf);
+    const pre = stats((await renderSound(name, { limiter: false })).buf);
+    const lo = stats((await renderSound(name, { pitch: 0.7 })).buf);
+    const hi = stats((await renderSound(name, { pitch: 1.4 })).buf);
+    const l50 = loudest50(buf);
+    const r = { dur, peak: st.peak, rms: st.rms, loud50: l50, prePeak: pre.peak, audibleTo: st.audibleTo, nan: st.nan, lo: lo.peak, hi: hi.peak };
+    results.sounds[name] = r;
+    const ok = st.peak > 0.02 && st.peak <= 1 && st.nan === 0 && lo.peak > 0.02 && hi.peak > 0.02 && lo.peak <= 1 && hi.peak <= 1;
+    if (!ok) results.failures.push(name);
+    lines.push(`${(ok ? '  ' : '!!')}${name.padEnd(13)} ${dur.toFixed(2).padStart(5)}  ${st.audibleTo.toFixed(2).padStart(6)}     ${st.peak.toFixed(3)}  ${db(st.peak).toFixed(1).padStart(6)}   ${db(st.rms).toFixed(1).padStart(6)}   ${db(l50).toFixed(1).padStart(6)}      ${pre.peak.toFixed(3)}       ${lo.peak.toFixed(2)}/${hi.peak.toFixed(2)}`);
+    drawTile(name, `${dur.toFixed(2)}s pk ${st.peak.toFixed(2)}`, buf, Math.min(3.2, Math.max(0.5, dur + 0.25)));
+  }
+
+  // everything at once — the limiter must keep it under 1.0
+  {
+    const ctx = new OfflineAudioContext(2, 44100 * 3, 44100);
+    const chain = buildMasterChain(ctx);
+    chain.output.connect(ctx.destination);
+    for (const name of SOUND_NAMES) SOUNDS[name](ctx, chain.sfx, { when: 0.02, pitch: 1 });
+    const st = stats(await ctx.startRendering());
+    results.allAtOnce = st.peak;
+    if (st.peak > 1) results.failures.push('allAtOnce');
+    lines.push(`\nALL ${SOUND_NAMES.length} sounds simultaneously: peak ${st.peak.toFixed(3)} (${st.peak <= 1 ? 'ok' : 'CLIPS'})`);
+  }
+
+  // music loops
+  lines.push('\nmusic          intensity  bpm  expected loop  measured loop  env-corr  raw-seam  env-seam  off-beat  peak   rms(dB)  sr');
+  results.music = {};
+  for (const kind of SONG_KINDS) {
+    for (const intensity of [0, 1]) {
+      const { buf, T, song } = await renderSong(kind, intensity, 2);
+      const st = stats(buf);
+      const m = measureLoop(buf, T);
+      const ok = Math.abs(m.measured - T) < 0.002 && m.seam > 0.999 && m.offBeatCorr < m.corr - 0.3 && st.peak <= 1 && st.peak > 0.05;
+      if (!ok) results.failures.push(`music:${kind}:${intensity}`);
+      results.music[`${kind}${intensity}`] = { T, ...m, peak: st.peak, rms: st.rms };
+      lines.push(`${ok ? '  ' : '!!'}${kind.padEnd(12)} ${String(intensity).padStart(5)}     ${String(intensity ? song.finalBpm : song.bpm).padStart(4)}   ${T.toFixed(4).padStart(9)} s    ${m.measured.toFixed(4).padStart(9)} s   ${m.corr.toFixed(4)}    ${m.seam.toFixed(5)}   ${m.seamEnv.toFixed(4)}   ${m.offBeatCorr.toFixed(3).padStart(6)}   ${st.peak.toFixed(3)}  ${db(st.rms).toFixed(1)}  ${buf.sampleRate}`);
+      drawTile(`music ${kind} i${intensity} (first 9 s)`, `${song.bars} bars, loop ${T.toFixed(2)} s`, buf, 9, true);
+    }
+  }
+
+  // engine loops
+  {
+    const buf = await engineOffline();
+    const st = stats(buf);
+    results.engine = { peak: st.peak, rms: st.rms, nan: st.nan };
+    if (!(st.peak > 0.02 && st.peak <= 1 && st.nan === 0)) results.failures.push('engine');
+    lines.push(`\nengine sim (idle → rev → accelerate+shifts → drift → offroad → boost → coast): peak ${st.peak.toFixed(3)} rms ${db(st.rms).toFixed(1)} dB`);
+    drawTile('engine sim: idle | rev | accel (gears) | drift 2.4-3.3 | offroad 3.5-4.2 | boost 4.2-5.1 | coast', '6.5 s', buf, 6.5, true);
+  }
+
+  lines.push(`\nFAILURES: ${results.failures.length ? results.failures.join(', ') : 'none'}`);
+  $('#report').textContent = lines.join('\n');
+  console.log(lines.join('\n'));
+  return results;
+}
+
+// Live sequencer timing test with the real AudioEngine (needs autoplay permission).
+async function runSequencerTest(seconds = 6) {
+  const a = new AudioEngine();
+  a.unlock();
+  await new Promise((r) => setTimeout(r, 300));
+  if (!a.ready) return { ok: false, error: 'AudioContext not running (autoplay blocked?)' };
+  a.setVolume(0.0001);
+  a.stepLog = [];
+  a.startMusic('race');
+  await new Promise((r) => setTimeout(r, seconds * 500));
+  a.setMusicIntensity(1);
+  await new Promise((r) => setTimeout(r, seconds * 500));
+  const L = a.stepLog;
+  const song = getSong('race');
+  const sd0 = songStepDuration(song, 0), sd1 = songStepDuration(song, 1);
+  let minLead = Infinity, maxErr = 0, n = 0, switched = -1, monotonic = true, stepOk = true;
+  for (let i = 0; i + 3 < L.length; i += 3) {
+    const [s0, t0, at0] = [L[i], L[i + 1], L[i + 2]];
+    const [s1, t1] = [L[i + 3], L[i + 4]];
+    minLead = Math.min(minLead, t0 - at0);
+    const d = t1 - t0;
+    const e = Math.min(Math.abs(d - sd0), Math.abs(d - sd1));
+    if (Math.abs(d - sd1) < 1e-9 && switched < 0) switched = s0;
+    maxErr = Math.max(maxErr, e);
+    if (d <= 0) monotonic = false;
+    if (s1 !== (s0 + 1) % song.totalSteps) stepOk = false;
+    n++;
+  }
+  a.dispose();
+  return { ok: maxErr < 1e-9 && monotonic && stepOk && minLead > 0, steps: n, maxIntervalError: maxErr, minLeadSeconds: minLead,
+    tempoSwitchAtStep: switched, switchOnBeat: switched >= 0 && switched % 4 === 0, monotonic, stepOk };
+}
+
+window.runAudioTests = runAudioTests;
+window.runSequencerTest = runSequencerTest;
+window.engineOffline = engineOffline;
+$('#run').onclick = runAudioTests;
+window.__ready = true;
+</script>
+</body>
+</html>

@@ -1,0 +1,247 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>World Sandbox</title>
+<link rel="icon" href="data:,">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #000; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #info { position: fixed; left: 8px; top: 6px; font: 12px/1.35 ui-monospace, Menlo, monospace; color: #fff;
+          text-shadow: 0 1px 2px #000, 0 0 4px #000; pointer-events: none; white-space: pre; }
+</style>
+<script type="importmap">{"imports":{"three":"/vendor/three/build/three.module.js","three/addons/":"/vendor/three/examples/jsm/"}}</script>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="info"></div>
+<script type="module">
+// World sandbox. URL params:
+//   ?view=N | name     camera preset (see VIEWS below)
+//   ?quality=low       build the low-quality world
+//   ?karts=1           place kart models on the grid (shadow check)
+//   ?chase=S&lat=L     chase camera at arc length S (lateral L)
+//   ?hud=0             hide the text overlay
+// Console helpers: setView(n), chaseAt(s, lat), verifyProps(), stats().
+import * as THREE from 'three';
+import { getTrack, CURB_WIDTH } from '../js/track.js';
+import { buildWorld } from '../js/world.js';
+
+const params = new URLSearchParams(location.search);
+const quality = params.get('quality') || 'high';
+const canvas = document.getElementById('c');
+const info = document.getElementById('info');
+if (params.get('hud') === '0') info.style.display = 'none';
+
+// Same renderer settings as SPEC §12 (main.js). three r186 removed
+// PCFSoftShadowMap (it falls back to PCFShadowMap with a warning); PCFShadowMap
+// is the soft Vogel-disk filter that honours light.shadow.radius.
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, powerPreference: 'high-performance' });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+renderer.setSize(window.innerWidth, window.innerHeight, false);
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFShadowMap;
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.1, 2000);
+const track = getTrack();
+
+const tb = performance.now();
+const world = buildWorld(scene, track, { renderer, quality });
+const buildMs = performance.now() - tb;
+console.log(`[world] built in ${buildMs.toFixed(0)} ms (quality ${quality}); instances ${JSON.stringify(world.stats.instances)}`);
+
+// ------------------------------------------------------------ optional karts
+const karts = [];
+if (params.get('karts') === '1') {
+  try {
+    const { CHARACTERS, buildKartModel } = await import('../js/characters.js');
+    for (let i = 0; i < 8; i++) {
+      const g = track.gridSlot(i);
+      const m = buildKartModel(CHARACTERS[i % CHARACTERS.length]);
+      m.position.copy(g.position); m.rotation.y = g.yaw;
+      scene.add(m); karts.push(m);
+    }
+  } catch (err) {
+    console.warn('[world] kart models unavailable, using boxes', err.message);
+    for (let i = 0; i < 8; i++) {
+      const g = track.gridSlot(i);
+      const m = new THREE.Mesh(new THREE.BoxGeometry(1.5, 1.2, 2.2), new THREE.MeshStandardMaterial({ color: 0xff5522 }));
+      m.position.copy(g.position).y += 0.6; m.rotation.y = g.yaw; m.castShadow = m.receiveShadow = true;
+      scene.add(m); karts.push(m);
+    }
+  }
+}
+
+// ------------------------------------------------------------ viewpoints
+const focus = new THREE.Vector3();
+const zone = (type) => track.zones.find((z) => z.type === type);
+const P = (s, lat = 0) => track.pointAt(s, lat);
+function chase(s, { back = 6.5, up = 2.6, ahead = 16, lat = 0, lookY = 1.0 } = {}) {
+  const c = P(s - back, lat), t = P(s + ahead, lat);
+  camera.position.set(c.x, c.y + up, c.z);
+  camera.lookAt(t.x, t.y + lookY, t.z);
+  focus.copy(P(s, lat));
+}
+function frameSide(s, side, dist, height, { lookUp = 0, ahead = 0 } = {}) {
+  const f = track.frameAt(s);
+  const c = new THREE.Vector3(f.x + f.right.x * side * dist + f.tangent.x * ahead, f.y + height, f.z + f.right.z * side * dist + f.tangent.z * ahead);
+  camera.position.copy(c);
+  camera.lookAt(f.x, f.y + lookUp, f.z);
+  focus.set(f.x, f.y, f.z);
+}
+function look(cam, target, foc = target) {
+  camera.position.set(...cam);
+  camera.lookAt(...target);
+  focus.set(...foc);
+}
+
+const L = track.length;
+const hill = zone('hill'), hair = zone('hairpin'), bridge = zone('bridge'), cliff = zone('cliff');
+const crestS = (() => { let best = 0, bi = 0; for (let i = 0; i < track.N; i++) if (track.py[i] > best) { best = track.py[i]; bi = i; } return bi * track.spacing; })();
+const ramp = track.ramps[0];
+const b = track.bounds, cx = (b.minX + b.maxX) / 2, cz = (b.minZ + b.maxZ) / 2;
+
+const VIEWS = [
+  { name: 'overview', set: () => look([cx + 140, 330, cz + 300], [cx, 0, cz - 10], [cx, 0, cz]) },
+  { name: 'start-chase', set: () => chase(track.gridSlot(7).s, { lat: track.gridSlot(7).lateral }) },
+  { name: 'hairpin', set: () => chase(hair.s0 + 6, { ahead: 18 }) },
+  { name: 'lighthouse', set: () => { const m = track.frameAt((hair.s0 + hair.s1) / 2); look([m.x + 40, m.y + 16, m.z - 52], [m.x - 30, m.y + 6, m.z + 25], [m.x, m.y, m.z]); } },
+  { name: 'bridge-chase', set: () => chase(bridge.s0 - 4, { ahead: 26 }) },
+  { name: 'bridge-side', set: () => frameSide((bridge.s0 + bridge.s1) / 2, -1, 70, 8, { lookUp: 3 }) },
+  { name: 'hill-crest', set: () => chase(crestS - 22, { ahead: 20 }) },
+  { name: 'kicker-ramp', set: () => chase(ramp.s0 - 9, { ahead: 14, lookY: 0.6 }) },
+  { name: 'cliff-chase', set: () => chase(cliff.s0 + 40, { ahead: 22 }) },
+  { name: 'cliff-sea', set: () => { const s = (cliff.s0 + cliff.s1) / 2; frameSide(s, -1, 95, 14, { lookUp: 0 }); } },
+  { name: 'grid-front', set: () => { const f = track.frameAt(4); look([f.x + f.tangent.x * 14, f.y + 3.2, f.z + f.tangent.z * 14], [f.x - f.tangent.x * 20, f.y + 2.5, f.z - f.tangent.z * 20], [f.x - f.tangent.x * 15, f.y, f.z - f.tangent.z * 15]); } },
+  { name: 'grandstand', set: () => { const f = track.frameAt(L - 20); look([f.x + f.right.x * 9 + f.tangent.x * 30, f.y + 4, f.z + f.right.z * 9 + f.tangent.z * 30], [f.x - f.right.x * 16, f.y + 3, f.z - f.right.z * 16], [f.x, f.y, f.z]); } },
+  { name: 'boost-pad', set: () => { const p = track.boostPads[0]; chase(p.s0 - 2, { lat: p.lateral, back: 5, up: 2.2, ahead: 10, lookY: 0 }); } },
+  { name: 'esses', set: () => chase(track.segments[3].s0 - 10, { ahead: 22 }) },
+  { name: 'top', set: () => look([cx, 700, cz + 0.01], [cx, 0, cz], [cx, 0, cz]) },
+  { name: 'turn1', set: () => chase(track.segments[1].s0 - 2, { ahead: 22 }) },
+  { name: 'harbor', set: () => chase(track.segments[9].s0 + 4, { ahead: 22 }) },
+  { name: 'ramp-side', set: () => frameSide(ramp.s0 + ramp.length * 0.6, 1, 14, 3.5, { lookUp: 0.6 }) },
+  { name: 'hill-side', set: () => frameSide(crestS, 1, 60, 10, { lookUp: 3 }) },
+  { name: 'home', set: () => chase(track.segments[14].s0 + 5, { ahead: 22 }) },
+  { name: 'kart-close', set: () => { const g = track.gridSlot(6), f = track.frameAt(g.s); const c = P(g.s - 4.5, g.lateral + 2.2); look([c.x, c.y + 1.9, c.z], [g.position.x, g.position.y + 0.4, g.position.z], [g.position.x, g.position.y, g.position.z]); } },
+  { name: 'lagoon', set: () => { const m = track.frameAt((bridge.s0 + bridge.s1) / 2); look([m.x + 10, 95, m.z + 75], [m.x, 0, m.z + 22], [m.x, m.y, m.z]); } },
+  { name: 'cliff-face', set: () => { const s = (cliff.s0 + cliff.s1) / 2 - 20; frameSide(s, -1, 38, 2.5, { lookUp: 2, ahead: -25 }); } },
+  { name: 'hairpin-exit', set: () => chase(hair.s1 - 18, { ahead: 26 }) },
+  { name: 'bridge-under', set: () => { const f = track.frameAt(bridge.s0 + 30); look([f.x + f.right.x * 26 + f.tangent.x * 6, -0.6, f.z + f.right.z * 26 + f.tangent.z * 6], [f.x + f.tangent.x * 30, 2, f.z + f.tangent.z * 30], [f.x, f.y, f.z]); } },
+];
+let viewIndex = 0;
+let onView = '';
+function setView(v) {
+  const i = typeof v === 'number' ? v : VIEWS.findIndex((x) => x.name === v);
+  viewIndex = ((i % VIEWS.length) + VIEWS.length) % VIEWS.length;
+  VIEWS[viewIndex].set();
+  onView = VIEWS[viewIndex].name;
+  for (let k = 0; k < 3; k++) frame(1 / 60);
+  return stats();
+}
+function chaseAt(s, lat = 0, opts = {}) { chase(s, { lat, ...opts }); onView = `chase s=${s}`; for (let k = 0; k < 3; k++) frame(1 / 60); return stats(); }
+
+// Draw-call / triangle stats: total (shadow + main pass) and main pass only.
+function stats() {
+  world.update(0, focus, camera);
+  renderer.render(scene, camera);
+  const total = { calls: renderer.info.render.calls, triangles: renderer.info.render.triangles };
+  renderer.shadowMap.autoUpdate = false;
+  renderer.render(scene, camera);
+  const main = { calls: renderer.info.render.calls, triangles: renderer.info.render.triangles };
+  renderer.shadowMap.autoUpdate = true;
+  const r = { view: onView, total, main, programs: renderer.info.programs.length, textures: renderer.info.memory.textures, geometries: renderer.info.memory.geometries };
+  console.log(`[stats] ${onView}: total calls ${total.calls} tris ${total.triangles} | main calls ${main.calls} tris ${main.triangles} | programs ${r.programs} tex ${r.textures} geo ${r.geometries}`);
+  info.textContent = `${quality} | view ${viewIndex}: ${onView}\ncalls ${total.calls} (main ${main.calls})  tris ${(total.triangles / 1000).toFixed(0)}k (main ${(main.triangles / 1000).toFixed(0)}k)`;
+  return r;
+}
+
+// Verify every prop footprint lies outside the drivable corridor of EVERY
+// nearby track section (brute force over all samples).
+function verifyProps(margin = 0) {
+  const props = world.stats.props || [];
+  const N = track.N, sp = track.spacing;
+  const bad = [];
+  let worst = Infinity;
+  for (const [x, z, r, kind] of props) {
+    for (let i = 0; i < N; i++) {
+      const dx = x - track.px[i], dz = z - track.pz[i];
+      if (dx * dx + dz * dz > 80 * 80) continue;
+      const along = dx * track.tx[i] + dz * track.tz[i];
+      if (Math.abs(along) > sp * 0.5 + r) continue;
+      const lat = dx * track.rx[i] + dz * track.rz[i];
+      const wall = lat >= 0 ? track.wr[i] : track.wl[i];
+      const clearance = Math.abs(lat) - r - wall;
+      // only count it if the footprint overlaps this sample's slice along the track
+      if (Math.abs(along) > sp * 0.5 + Math.max(0, r - Math.max(0, Math.abs(lat) - wall))) continue;
+      if (clearance < worst) worst = clearance;
+      if (clearance < margin) { bad.push({ kind, x: +x.toFixed(1), z: +z.toFixed(1), r: +r.toFixed(2), s: +(i * sp).toFixed(0), lat: +lat.toFixed(2), wall: +wall.toFixed(2), clearance: +clearance.toFixed(2) }); break; }
+    }
+  }
+  const byKind = {};
+  for (const p of props) byKind[p[3]] = (byKind[p[3]] || 0) + 1;
+  const res = { checked: props.length, byKind, intrusions: bad.length, worstClearance: +worst.toFixed(2), sample: bad.slice(0, 12) };
+  console.log('[verifyProps]', JSON.stringify(res));
+  return res;
+}
+
+// Features on the road: item boxes, boost pads, ramps must lie on the road.
+function verifyFeatures() {
+  const proj = {};
+  const out = { boxes: 0, boxesOff: 0, pads: 0, padsOff: 0, ramps: 0, rampsOff: 0 };
+  for (const bx of track.itemBoxes) {
+    track.project(bx.position, -1, proj); out.boxes++;
+    if (Math.abs(proj.lateral) > proj.halfWidth - 0.8 || proj.surface === 'offroad') out.boxesOff++;
+  }
+  for (const p of track.boostPads) {
+    out.pads++;
+    for (const t of [0, 0.5, 1]) for (const lat of [p.lat0, p.lat1]) {
+      const f = track.frameAt(p.s0 + p.length * t);
+      if (Math.abs(lat) > f.halfWidth) { out.padsOff++; }
+    }
+  }
+  for (const r of track.ramps) {
+    out.ramps++;
+    if (!r.fullWidth) for (const t of [0, 1]) { const f = track.frameAt(r.s0 + r.length * t); if (Math.abs(r.lat0) > f.halfWidth || Math.abs(r.lat1) > f.halfWidth) out.rampsOff++; }
+  }
+  console.log('[verifyFeatures]', JSON.stringify(out));
+  return out;
+}
+
+// ------------------------------------------------------------ loop
+let last = performance.now();
+let frames = 0, fpsT = 0, fps = 0;
+function frame(dt) {
+  world.update(dt, focus, camera);
+  renderer.render(scene, camera);
+}
+function loop(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  frame(dt);
+  frames++; fpsT += dt;
+  if (fpsT > 1) { fps = frames / fpsT; frames = 0; fpsT = 0; }
+  requestAnimationFrame(loop);
+}
+window.addEventListener('resize', () => {
+  renderer.setSize(window.innerWidth, window.innerHeight, false);
+  camera.aspect = window.innerWidth / window.innerHeight; camera.updateProjectionMatrix();
+});
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowRight') setView(viewIndex + 1);
+  if (e.key === 'ArrowLeft') setView(viewIndex - 1);
+});
+
+Object.assign(window, { THREE, scene, camera, renderer, track, world, setView, chaseAt, stats, verifyProps, verifyFeatures, VIEWS,
+  fps: () => fps, look: (c, t) => { look(c, t); for (let k = 0; k < 3; k++) frame(1 / 60); return stats(); } });
+
+if (params.get('chase') !== null) chaseAt(Number(params.get('chase')), Number(params.get('lat') || 0));
+else setView(/^\d+$/.test(params.get('view') || '') ? Number(params.get('view')) : (params.get('view') || 0));
+requestAnimationFrame(loop);
+window.__ready = true;
+</script>
+</body>
+</html>

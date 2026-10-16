@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<link rel="icon" href="data:,">
+<title>KRISHIV KART — input tests</title>
+<style>
+  body { margin: 0; padding: 16px; background: #12101c; color: #e8e6f5; font: 13px/1.45 ui-monospace, Menlo, monospace; }
+  .pass { color: #6dffa0; } .fail { color: #ff6d7a; }
+  #live { margin-top: 16px; padding: 10px; background: #1d1930; border-radius: 8px; white-space: pre; }
+  input { margin-top: 10px; }
+</style>
+</head>
+<body>
+<h3>Input tests</h3>
+<div id="out"></div>
+<input id="field" placeholder="typing here must not steer">
+<div id="live"></div>
+<script type="module">
+import { Input } from '../js/input.js';
+
+const out = document.getElementById('out');
+const results = [];
+function check(name, cond, detail = '') {
+  results.push({ name, ok: !!cond, detail });
+  const d = document.createElement('div');
+  d.className = cond ? 'pass' : 'fail';
+  d.textContent = `${cond ? 'PASS' : 'FAIL'}  ${name}${detail ? '  — ' + detail : ''}`;
+  out.appendChild(d);
+}
+const near = (a, b, eps = 1e-6) => Math.abs(a - b) <= eps;
+const DT = 1 / 60;
+
+function key(type, code, opts = {}) {
+  const keyMap = { Space: ' ', Enter: 'Enter', Escape: 'Escape', ArrowLeft: 'ArrowLeft', ArrowRight: 'ArrowRight', ArrowUp: 'ArrowUp', ArrowDown: 'ArrowDown' };
+  const ev = new KeyboardEvent(type, { code, key: keyMap[code] || code.replace('Key', '').toLowerCase(), bubbles: true, cancelable: true, ...opts });
+  (opts.target || window).dispatchEvent(ev);
+  return ev;
+}
+const down = (c, o) => key('keydown', c, o);
+const up = (c, o) => key('keyup', c, o);
+
+function runInputTests() {
+  results.length = 0;
+  out.innerHTML = '';
+  const input = new Input();
+
+  // ---- steering smoothing (ramp ~7/s, return ~10/s)
+  down('ArrowRight');
+  input.update(DT);
+  check('steer ramps toward +1 at ~7/s (1 frame)', near(input.steer, 7 / 60, 1e-4), input.steer.toFixed(4));
+  const ramp = [input.steer];
+  for (let i = 0; i < 10; i++) { input.update(DT); ramp.push(input.steer); }
+  check('steer reaches full right lock in ~0.15 s', near(ramp[8], 1) && ramp[7] < 1, ramp.map((v) => v.toFixed(2)).join(' '));
+  up('ArrowRight');
+  input.update(DT);
+  check('steer returns at ~10/s on release (1 frame)', near(input.steer, 1 - 10 / 60, 1e-4), input.steer.toFixed(4));
+  for (let i = 0; i < 6; i++) input.update(DT);
+  check('steer back to center within 0.12 s', input.steer === 0, input.steer.toFixed(4));
+  down('KeyD'); for (let i = 0; i < 12; i++) input.update(DT); up('KeyD');
+  down('KeyA');
+  input.update(DT);
+  const afterRev = input.steer;
+  for (let i = 0; i < 20; i++) input.update(DT);
+  check('reversing D→A passes center fast and reaches -1', afterRev < 1 - 16 / 60 + 1e-4 && near(input.steer, -1), `${afterRev.toFixed(3)} → ${input.steer}`);
+  down('KeyD'); input.update(DT);
+  check('both left+right held cancels toward 0', input.steer > -1, input.steer.toFixed(3));
+  up('KeyA'); up('KeyD'); for (let i = 0; i < 20; i++) input.update(DT);
+
+  // ---- throttle / brake / drift / look back
+  down('ArrowUp'); input.update(DT);
+  check('ArrowUp → throttle 1', input.throttle === 1);
+  up('ArrowUp'); down('KeyW'); input.update(DT);
+  check('W → throttle 1', input.throttle === 1);
+  up('KeyW'); input.update(DT);
+  check('release → throttle 0', input.throttle === 0);
+  down('ArrowDown'); input.update(DT);
+  check('ArrowDown → brake 1', input.brake === 1);
+  up('ArrowDown'); input.update(DT);
+  down('Space'); input.update(DT);
+  check('Space held → drift', input.drift === true);
+  input.update(DT);
+  check('drift stays true while held', input.drift === true);
+  up('Space'); down('ShiftLeft'); input.update(DT);
+  check('Shift → drift', input.drift === true);
+  up('ShiftLeft'); input.update(DT);
+  check('release → drift false', input.drift === false);
+  down('KeyC'); input.update(DT);
+  check('C held → lookBack', input.lookBack === true);
+  up('KeyC'); input.update(DT);
+
+  // ---- item edge
+  down('KeyX'); input.update(DT);
+  check('item press → itemPressed on the press frame', input.itemPressed === true);
+  input.update(DT);
+  check('itemPressed false on the next frame while still held', input.itemPressed === false);
+  down('KeyX', { repeat: true }); input.update(DT);
+  check('auto-repeat keydown does not re-fire item', input.itemPressed === false);
+  up('KeyX'); input.update(DT);
+  down('KeyE'); up('KeyE'); input.update(DT);
+  check('press+release between frames still fires once', input.itemPressed === true);
+  input.update(DT);
+  check('...and only once', input.itemPressed === false);
+  for (const c of ['KeyZ']) { down(c); input.update(DT); const ok = input.itemPressed; up(c); input.update(DT); check(`${c} → item`, ok); }
+  // Ctrl is NOT an item key (Ctrl+W next to gas closes the tab on Windows / Linux)
+  down('ControlLeft'); input.update(DT); check('ControlLeft is not an item key', !input.itemPressed); up('ControlLeft'); input.update(DT);
+
+  // ---- pause / menu edges
+  down('Escape'); input.update(DT);
+  check('Escape → pausePressed + menu.back edge', input.pausePressed && input.menu.back && !input.phonePausePressed);
+  input.update(DT);
+  check('pause/back edges clear next frame', !input.pausePressed && !input.menu.back);
+  up('Escape');
+  down('KeyP'); input.update(DT); check('P → pausePressed', input.pausePressed); up('KeyP'); input.update(DT);
+  const menuCases = [['ArrowLeft', 'left'], ['ArrowRight', 'right'], ['ArrowUp', 'up'], ['ArrowDown', 'down'], ['KeyW', 'up'], ['KeyS', 'down'], ['Enter', 'confirm'], ['Backspace', 'back']];
+  for (const [code, field] of menuCases) {
+    down(code); input.update(DT);
+    const on = input.menu[field];
+    const others = Object.entries(input.menu).filter(([k, v]) => k !== field && v).map(([k]) => k);
+    input.update(DT);
+    const off = !input.menu[field];
+    up(code); input.update(DT);
+    check(`${code} → menu.${field} for exactly one frame`, on && off && others.length === 0, others.length ? 'also ' + others : '');
+  }
+  check('anyPressed edge works', (() => { down('KeyQ'); input.update(DT); const a = input.anyPressed; input.update(DT); const b = input.anyPressed; up('KeyQ'); return a && !b; })());
+
+  // ---- preventDefault
+  const evSpace = down('Space'); up('Space');
+  const evArrow = down('ArrowDown'); up('ArrowDown');
+  const evQ = down('KeyQ'); up('KeyQ');
+  check('Space / arrows keydown are preventDefault()ed', evSpace.defaultPrevented && evArrow.defaultPrevented);
+  check('unbound keys are left alone', !evQ.defaultPrevented);
+  const evCmdR = down('KeyR', { metaKey: true }); up('KeyR');
+  check('browser shortcuts (Cmd+R) not blocked', !evCmdR.defaultPrevented);
+  input.update(DT); input.update(DT);
+
+  // ---- blur releases everything
+  down('ArrowUp'); down('ArrowLeft'); down('Space');
+  for (let i = 0; i < 5; i++) input.update(DT);
+  const before = { t: input.throttle, s: input.steer, d: input.drift };
+  window.dispatchEvent(new Event('blur'));
+  input.update(DT);
+  check('window blur releases held keys', before.t === 1 && before.s < 0 && before.d && input.throttle === 0 && input.steer === 0 && !input.drift,
+    `before ${JSON.stringify(before)} after t=${input.throttle} s=${input.steer} d=${input.drift}`);
+  up('ArrowUp'); up('ArrowLeft'); up('Space');
+
+  // ---- typing in a text field is ignored
+  const field = document.getElementById('field');
+  const evField = down('ArrowLeft', { target: field });
+  input.update(DT);
+  check('keys typed into a text input are ignored', input.steer === 0 && !evField.defaultPrevented);
+  up('ArrowLeft', { target: field });
+
+  // ---- phone source
+  const phone = { active: true, input: { steer: 0.42, gas: 1, brake: 0, drift: 0, itemSeq: 5, pauseSeq: 2, lastUpdate: performance.now() } };
+  input.setPhone(phone);
+  input.update(DT);
+  check('phone steer used directly + gas → throttle', near(input.steer, 0.42) && input.throttle === 1 && input.phoneActive, `steer ${input.steer}`);
+  check('no spurious item/pause edge on first phone frame', !input.itemPressed && !input.pausePressed);
+  check('lastSource = phone after phone button change', input.lastSource === 'phone');
+  phone.input.itemSeq = 6; input.update(DT);
+  check('phone itemSeq increment → itemPressed', input.itemPressed);
+  input.update(DT);
+  check('...one frame only', !input.itemPressed);
+  phone.input.itemSeq = 9; input.update(DT);
+  check('multiple presses between frames → still an edge', input.itemPressed);
+  phone.input.pauseSeq = 3; input.update(DT);
+  check('phone pauseSeq increment → pausePressed + phonePausePressed (pause-only)', input.pausePressed && input.phonePausePressed);
+  input.update(DT);
+  check('phone pause edge clears next frame', !input.pausePressed && !input.phonePausePressed);
+  phone.input.itemSeq = 0; input.update(DT);
+  check('sequence reset (new pad) does not fire', !input.itemPressed);
+  phone.input.itemSeq = 1; input.update(DT);
+  check('first press after reset fires', input.itemPressed);
+  down('ArrowRight'); input.update(DT);
+  check('held steer key overrides phone steer', near(input.steer, 7 / 60, 1e-4), input.steer.toFixed(3));
+  up('ArrowRight'); input.update(DT);
+  check('phone steer resumes when key released', near(input.steer, 0.42));
+  phone.input.drift = 1; phone.input.gas = 0; phone.input.brake = 1; input.update(DT);
+  check('phone drift + brake', input.drift && input.brake === 1 && input.throttle === 0);
+  phone.input.steer = NaN; input.update(DT);
+  check('NaN phone steer is sanitized', input.steer === 0);
+  phone.active = false; phone.input.steer = 0.9; input.update(DT);
+  check('inactive phone ignored', input.steer === 0 && input.throttle === 0 && !input.drift && !input.phoneActive);
+  input.setPhone(null); input.update(DT);
+  check('null phone is safe', input.steer === 0);
+
+  // ---- gamepad (mocked navigator.getGamepads)
+  const btns = Array.from({ length: 17 }, () => ({ pressed: false, value: 0 }));
+  const fake = { index: 0, connected: true, mapping: 'standard', axes: [0, 0, 0, 0], buttons: btns };
+  const orig = navigator.getGamepads;
+  navigator.getGamepads = () => [fake, null, null, null];
+  try {
+    input.update(DT);
+    check('gamepad detected', input.gamepadConnected);
+    fake.axes[0] = 0.1; input.update(DT);
+    check('stick inside deadzone → 0', input.steer === 0);
+    fake.axes[0] = 0.6; input.update(DT);
+    check('stick 0.6 → rescaled steer', near(input.steer, (0.6 - 0.15) / 0.85, 1e-4), input.steer.toFixed(4));
+    check('lastSource = gamepad', input.lastSource === 'gamepad');
+    fake.axes[0] = -1; input.update(DT);
+    check('stick full left → -1', input.steer === -1);
+    fake.axes[0] = 0;
+    btns[0].pressed = true; btns[0].value = 1; input.update(DT);
+    check('A → throttle + menu.confirm edge', input.throttle === 1 && input.menu.confirm);
+    input.update(DT);
+    check('A confirm edge only once', !input.menu.confirm && input.throttle === 1);
+    btns[0].pressed = false; btns[0].value = 0;
+    btns[7].value = 0.5; input.update(DT);
+    check('RT analog → throttle 0.5', near(input.throttle, 0.5));
+    btns[7].value = 0;
+    btns[5].pressed = true; input.update(DT);
+    check('RB → drift', input.drift); btns[5].pressed = false;
+    btns[4].pressed = true; input.update(DT);
+    const lbEdge = input.itemPressed; input.update(DT);
+    check('LB → item edge once', lbEdge && !input.itemPressed); btns[4].pressed = false; input.update(DT);
+    btns[9].pressed = true; input.update(DT);
+    check('Start → pause edge', input.pausePressed); btns[9].pressed = false; input.update(DT);
+    btns[13].pressed = true; input.update(DT);
+    check('d-pad down → menu.down edge', input.menu.down); btns[13].pressed = false; input.update(DT);
+    fake.axes[1] = 0.9; input.update(DT);
+    const sDown = input.menu.down; input.update(DT);
+    check('stick down → one menu.down edge (latched)', sDown && !input.menu.down);
+    fake.axes[1] = 0.5; input.update(DT); fake.axes[1] = 0.9; input.update(DT);
+    check('stick must return past hysteresis before re-firing', !input.menu.down);
+    fake.axes[1] = 0; input.update(DT); fake.axes[1] = 0.9; input.update(DT);
+    check('...fires again after returning to center', input.menu.down);
+    fake.axes[1] = 0; input.update(DT);
+    fake.axes[0] = 0.8; down('ArrowLeft'); input.update(DT);
+    check('held steer key beats gamepad stick', input.steer < 0);
+    up('ArrowLeft'); fake.axes[0] = 0;
+  } finally {
+    navigator.getGamepads = orig;
+  }
+
+  // ---- dispose detaches listeners
+  input.dispose();
+  down('ArrowUp'); input.update(DT);
+  check('dispose() removes listeners', input.throttle === 0);
+  up('ArrowUp');
+
+  const failed = results.filter((r) => !r.ok);
+  const summary = `${results.length - failed.length}/${results.length} input tests passed`;
+  console.log(summary + (failed.length ? '\nFAILED: ' + failed.map((f) => f.name + ' ' + f.detail).join('\n') : ''));
+  return { passed: results.length - failed.length, total: results.length, failed };
+}
+
+window.runInputTests = runInputTests;
+runInputTests();
+
+// live monitor for manual testing
+const live = new Input();
+const liveEl = document.getElementById('live');
+let last = performance.now();
+(function loop(now) {
+  live.update((now - last) / 1000); last = now;
+  liveEl.textContent = `LIVE  steer ${live.steer.toFixed(2)}  throttle ${live.throttle}  brake ${live.brake}  drift ${live.drift}  look ${live.lookBack}  source ${live.lastSource}  pad ${live.gamepadConnected}`;
+  requestAnimationFrame(loop);
+})(last);
+</script>
+</body>
+</html>
